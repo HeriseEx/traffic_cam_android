@@ -105,6 +105,14 @@ class TrafficPipelineTest {
         assertFalse(ViolationPolicy.holdKept(2999))
         assertTrue(ViolationPolicy.holdKept(3000))
         assertEquals(8000L, ViolationPolicy.LEAD_MS)
+        assertTrue(historyVisible("ANALYZED", "field", "field"))
+        assertFalse(historyVisible("ANALYZED", "other", "field"))
+        assertTrue(historyVisible("NEED_NOTE", "", "field"))
+        assertFalse(historyVisible("ANALYZED", "field", ""))
+        assertTrue(historyVisible("NEED_NOTE", "field", ""))
+        assertFalse(recoverLocalClip("a.mp4", setOf("a.mp4"), emptySet()))
+        assertFalse(recoverLocalClip("a.mp4", emptySet(), setOf("a.mp4")))
+        assertTrue(recoverLocalClip("b.mp4", setOf("a.mp4"), setOf("a.mp4")))
     }
 
     @Test fun redLightRequiresStableStopLineAndDoesNotInventCutIn() {

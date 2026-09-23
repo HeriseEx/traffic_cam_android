@@ -30,7 +30,10 @@ class TaskSync private constructor(private val context: Context) {
     val state = mutable.asStateFlow()
     private fun records(): List<JSONObject> {
         val all = database.getJSONObject("records")
-        return all.keys().asSequence().map { all.getJSONObject(it) }.sortedByDescending { it.optDouble("created_at", 0.0) }.toList()
+        val me = connection.account()
+        return all.keys().asSequence().map { all.getJSONObject(it) }
+            .filter { historyVisible(it.optString("status"), it.optString("uploader").ifBlank { it.optString("account") }, me) }
+            .sortedByDescending { it.optDouble("created_at", 0.0) }.toList()
     }
     private fun publish(connected: Boolean = mutable.value.connected, message: String = mutable.value.message) {
         mutable.value = SyncState(connected, message, records())
@@ -39,6 +42,8 @@ class TaskSync private constructor(private val context: Context) {
         val all = database.getJSONObject("records")
         val previous = all.optJSONObject(task.getString("event_id"))
         val capture = previous?.optJSONObject("mobile_capture") ?: previous?.optJSONObject("metadata")?.optJSONObject("capture")
+        val account = previous?.optString("account").orEmpty().ifBlank { task.optString("uploader") }
+        if (account.isNotBlank()) task.put("account", account)
         if (capture != null) task.put("mobile_capture", capture)
         // A response lost after acceptance is recovered through /changes; clean up only after a matching checksum.
         val local = previous?.optString("local_file")?.takeIf { it.isNotBlank() }
@@ -76,7 +81,7 @@ class TaskSync private constructor(private val context: Context) {
         require(endpoint.isNotBlank()) { "请先保存服务地址" }
         val out = BackendClient(endpoint, "").request("POST", "/v1/login", JSONObject()
             .put("username", username).put("password", password))
-        connection.save(endpoint, out.getString("session"))
+        connection.save(endpoint, out.getString("session"), out.getString("username"))
         return out.getString("username")
     }
 
@@ -85,7 +90,7 @@ class TaskSync private constructor(private val context: Context) {
         require(endpoint.isNotBlank()) { "请先保存服务地址" }
         val out = BackendClient(endpoint, "").request("POST", "/v1/register", JSONObject()
             .put("token", token).put("username", username).put("password", password))
-        connection.save(endpoint, out.getString("session"))
+        connection.save(endpoint, out.getString("session"), out.getString("username"))
         return out.getString("username")
     }
 
@@ -157,6 +162,7 @@ class TaskSync private constructor(private val context: Context) {
             require(file.length() in 1..maxUploadBytes) { "视频为空或超过 200 MiB" }
             val existing = records().firstOrNull { it.optString("local_file") == file.name }
             if (existing != null) return@withLock existing
+            if (file.name in discardedNames()) error("该片段已删除")
             val id = try { UUID.fromString(file.nameWithoutExtension).toString() } catch (_: Exception) { UUID.randomUUID().toString() }
             val digest = MessageDigest.getInstance("SHA-256")
             file.inputStream().use { input -> val buffer = ByteArray(64 * 1024)
@@ -182,7 +188,8 @@ class TaskSync private constructor(private val context: Context) {
                 catch (error: Exception) { journal.failWrite(stream); throw error }
             }
             val pending = JSONObject().put("event_id", metadata.getString("event_id")).put("status", queued).put("metadata", metadata)
-                .put("local_file", file.name).put("endpoint", savedEndpoint).put("created_at", System.currentTimeMillis() / 1000.0)
+                .put("local_file", file.name).put("endpoint", savedEndpoint).put("account", connection.account())
+                .put("created_at", System.currentTimeMillis() / 1000.0)
                 .put("sha256", digest.digest().joinToString("") { "%02x".format(it) })
             database.getJSONObject("records").put(pending.getString("event_id"), pending); persist(); publish(message = "片段已保存，等待自动上传")
             UploadJobService.schedule(context)
@@ -215,27 +222,71 @@ class TaskSync private constructor(private val context: Context) {
     }
 
     suspend fun discardLocal(eventId: String) = withContext(Dispatchers.IO) {
-        mutex.withLock {
-            val row = database.getJSONObject("records").optJSONObject(eventId) ?: return@withLock
+        val name = mutex.withLock {
+            val records = database.getJSONObject("records")
+            val key = when {
+                records.has(eventId) -> eventId
+                else -> records.keys().asSequence().firstOrNull { records.getJSONObject(it).optString("event_id") == eventId }
+            } ?: error("记录不存在")
+            val row = records.getJSONObject(key)
             require(row.optString("status") in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR", "NEED_NOTE")) { "仅可删除未上传的本地片段" }
-            val name = File(row.getString("local_file")).name
-            val video = File(clips, name)
-            require(!video.exists() || video.delete()) { "无法删除本地文件" }
-            File(clips, name + ".event.json").delete()
-            database.getJSONObject("records").remove(eventId); persist(); publish(message="已删除本地片段")
+            val filename = File(row.optString("local_file")).name
+            if (filename.isNotBlank()) tombstone(filename)
+            records.remove(key)
+            persist()
+            publish(message = "已删除本地片段")
+            filename
         }
+        if (name.isNotBlank()) {
+            File(clips, name).delete()
+            File(clips, "$name.event.json").delete()
+        }
+    }
+
+    private fun discardedNames(): Set<String> {
+        val list = database.optJSONArray("discarded") ?: return emptySet()
+        return (0 until list.length()).map { list.optString(it) }.filter { it.isNotBlank() }.toSet()
+    }
+
+    private fun tombstone(name: String) {
+        val list = database.optJSONArray("discarded") ?: JSONArray().also { database.put("discarded", it) }
+        if ((0 until list.length()).any { list.optString(it) == name }) return
+        list.put(name)
+        while (list.length() > 200) list.remove(0)
     }
 
     suspend fun tick() = withContext(Dispatchers.IO) {
         // Only complete, atomically renamed exports are *.mp4; interrupted muxing remains *.partial.
         clips.listFiles()?.filter { it.extension == "mp4" && System.currentTimeMillis() - it.lastModified() > 30_000 }?.forEach { file ->
-            val known = mutex.withLock { records().any { it.optString("local_file") == file.name || it.optString("event_id") == file.nameWithoutExtension } }
-            if (!known) try { enqueue(file, "import", "恢复上次已保存的片段") } catch (_: Exception) { }
+            val recover = mutex.withLock {
+                val all = database.getJSONObject("records")
+                val known = all.keys().asSequence().map { all.getJSONObject(it) }.any { row ->
+                    val stored = row.optString("local_file")
+                    stored == file.name || File(stored).name == file.name || row.optString("event_id") == file.nameWithoutExtension
+                }
+                if (file.name in discardedNames()) {
+                    file.delete()
+                    File(clips, file.name + ".event.json").delete()
+                }
+                recoverLocalClip(file.name, if (known) setOf(file.name) else emptySet(), discardedNames())
+            }
+            if (recover) try { enqueue(file, "import", "恢复上次已保存的片段") } catch (_: Exception) { }
         }
         if (!mutex.tryLock()) return@withContext
         try {
             if (!configured()) { publish(false, "服务器未配置 · 片段保存在手机"); return@withContext }
             val api = client()
+            if (connection.account().isBlank()) {
+                try {
+                    val me = api.request("GET", "/v1/account")
+                    val token = connection.load().second
+                    if (token.isNotBlank() && me.optString("username").isNotBlank())
+                        connection.save(api.endpoint, token, me.getString("username"))
+                } catch (error: Exception) {
+                    val text = error.message.orEmpty()
+                    if (!text.contains("HTTP 401") && !text.contains("HTTP 403")) throw error
+                }
+            }
             val all = database.getJSONObject("records")
             val pending = records().lastOrNull { it.optString("status") == "PENDING_UPLOAD" && it.optString("endpoint") in setOf("", api.endpoint) && it.optLong("next_retry_at") <= System.currentTimeMillis() }
             if (pending != null) {
@@ -282,10 +333,18 @@ class TaskSync private constructor(private val context: Context) {
                 cursors.put(api.endpoint, response.getLong("cursor")); persist()
                 more = response.optBoolean("has_more"); pages++
             } while (more && pages < 5)
-            val listed = api.request("GET", "/v1/tasks?limit=100").optJSONArray("tasks") ?: JSONArray()
-            for (index in 0 until listed.length()) {
-                val task = listed.getJSONObject(index).put("endpoint", api.endpoint)
-                rememberRemote(task)
+            val listedPages = 5
+            var offset = 0
+            var page = 0
+            while (page < listedPages) {
+                val listed = api.request("GET", "/v1/tasks?limit=100&offset=$offset").optJSONArray("tasks") ?: JSONArray()
+                for (index in 0 until listed.length()) {
+                    val task = listed.getJSONObject(index).put("endpoint", api.endpoint)
+                    rememberRemote(task)
+                }
+                page++
+                if (listed.length() < 100) break
+                offset += listed.length()
             }
             persist()
             records().filter { it.optString("status") !in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR", "NEED_NOTE") }.forEach { row ->
@@ -317,3 +376,13 @@ class TaskSync private constructor(private val context: Context) {
         }
     }
 }
+
+/** Server rows follow the logged-in account. Unsent clips stay on the phone until that account submits them. */
+fun historyVisible(status: String, owner: String, account: String): Boolean {
+    val local = status in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR", "NEED_NOTE")
+    if (account.isBlank()) return local
+    return owner == account || (local && owner.isBlank())
+}
+
+fun recoverLocalClip(fileName: String, knownFiles: Set<String>, discarded: Set<String>) =
+    fileName !in discarded && fileName !in knownFiles

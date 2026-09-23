@@ -5,6 +5,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -12,6 +14,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
@@ -61,6 +64,7 @@ class BackendActivity : ComponentActivity() {
         var busy by remember { mutableStateOf(false) }
         var preview by remember { mutableStateOf<java.io.File?>(null) }
         var deleteTarget by remember { mutableStateOf<String?>(null) }
+        var hidden by remember { mutableStateOf(setOf<String>()) }
         var noteTarget by remember { mutableStateOf<String?>(null) }
         var noteText by remember { mutableStateOf("") }
         val state by sync.state.collectAsState()
@@ -103,12 +107,15 @@ class BackendActivity : ComponentActivity() {
             Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.SpaceBetween, verticalAlignment=Alignment.CenterVertically) {
-                    Text("取证记录", style = MaterialTheme.typography.headlineSmall)
+                Text("取证记录${sync.connection.account().let { if (it.isBlank()) "" else " · $it" }}", style = MaterialTheme.typography.headlineSmall)
                     TextButton(onClick={finish()}) { Text("返回监看") }
                 }
-                val pendingCount = state.records.count { it.optString("status") == "PENDING_UPLOAD" }
-                val failedCount = state.records.count { it.optString("status") in setOf("UPLOAD_ERROR", "LOCAL_ERROR", "ERROR") }
-                Text("待上传 $pendingCount · 需处理 $failedCount · 共 ${state.records.size} 条")
+                val visible = state.records.filter { it.optString("event_id") !in hidden }
+                val pendingCount = visible.count { it.optString("status") == "PENDING_UPLOAD" }
+                val noteCount = visible.count { it.optString("status") == "NEED_NOTE" }
+                val failedCount = visible.count { it.optString("status") in setOf("UPLOAD_ERROR", "LOCAL_ERROR", "ERROR") }
+                Text("待上传 $pendingCount · 需处理 $failedCount · 待补备注 $noteCount · 共 ${visible.size} 条",
+                    color = if (noteCount > 0) Color(0xFFFFB74D) else Color.Unspecified)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(endpoint, { endpoint = it }, label = { Text("服务地址") }, singleLine = true,
                         enabled = !busy, modifier = Modifier.weight(1f))
@@ -124,7 +131,8 @@ class BackendActivity : ComponentActivity() {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(enabled = !busy && accountName.isNotBlank() && accountPassword.length >= 8, onClick = { action {
                         val name = withContext(Dispatchers.IO) { sync.loginAccount(accountName.trim(), accountPassword) }
-                        "已登录 $name"
+                        sync.tick()
+                        "已登录 $name，记录已按该账户同步"
                     } }) { Text("登录") }
                     OutlinedTextField(inviteToken, { inviteToken = it }, label = { Text("邀请链接") }, singleLine = true, enabled = !busy, modifier = Modifier.weight(1f))
                     OutlinedButton(enabled = !busy && inviteToken.isNotBlank() && accountName.isNotBlank() && accountPassword.length >= 8, onClick = { action {
@@ -134,7 +142,8 @@ class BackendActivity : ComponentActivity() {
                             if (origin.isNotEmpty()) sync.connection.save(origin, "")
                             sync.registerAccount(token, accountName.trim(), accountPassword)
                         }
-                        "已注册 $name"
+                        sync.tick()
+                        "已注册 $name，记录已按该账户同步"
                     } }) { Text("注册") }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -162,20 +171,24 @@ class BackendActivity : ComponentActivity() {
                 }
                 Text("业务记录", style = MaterialTheme.typography.titleLarge)
                 var filter by remember { mutableStateOf("全部") }
-                Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                    listOf("全部", "待上传", "需处理").forEach { label -> FilterChip(filter==label, {filter=label}, label={Text(label)}) }
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                    listOf("全部", "待上传", "需处理", "待补备注").forEach { label -> FilterChip(filter==label, {filter=label}, label={Text(label)}) }
                 }
-                val filtered = state.records.filter { when(filter) {
+                val filtered = visible.filter { when(filter) {
                     "待上传" -> it.optString("status")=="PENDING_UPLOAD"
-                    "需处理" -> it.optString("status") in setOf("UPLOAD_ERROR", "LOCAL_ERROR", "ERROR")
+                    "需处理" -> it.optString("status") in setOf("UPLOAD_ERROR", "LOCAL_ERROR", "ERROR", "NEED_NOTE")
+                    "待补备注" -> it.optString("status")=="NEED_NOTE"
                     else -> true
                 } }
                 if (filtered.isEmpty()) Text("暂无${if(filter=="全部") "取证" else filter}记录。监看时发现疑似事件会自动保存。",style=MaterialTheme.typography.bodyMedium)
                 filtered.take(100).forEach { task ->
+                    val needsNote = task.optString("status") == "NEED_NOTE"
                     val result = task.optJSONObject("effective_result") ?: task.optJSONObject("result")
                     val review = task.optJSONObject("review")
-                    Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("状态：${taskStatus(task.optString("status"))}", style = MaterialTheme.typography.titleMedium)
+                    Card(Modifier.fillMaxWidth(), border = if (needsNote) BorderStroke(2.dp, Color(0xFFFFB74D)) else null,
+                        colors = if (needsNote) CardDefaults.cardColors(containerColor = Color(0xFF4A2C14)) else CardDefaults.cardColors()) { Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (needsNote) Text("缺少定位，填写备注后才能上传", color = Color(0xFFFFB74D), style = MaterialTheme.typography.titleMedium)
+                        Text("状态：${taskStatus(task.optString("status"))}", style = MaterialTheme.typography.titleMedium, color = if (needsNote) Color(0xFFFFB74D) else Color.Unspecified)
                         Text("车牌：${result?.optString("plate")?.takeUnless { it.isBlank() || it == "null" } ?: "未确认"}")
                         Text("信号灯：${signalName(task.optJSONObject("result")?.optJSONObject("signal_state"))}")
                         Text("违法行为：${violationName(result?.optString("violation_type").orEmpty())}")
@@ -237,7 +250,14 @@ class BackendActivity : ComponentActivity() {
         }
         deleteTarget?.let { id -> AlertDialog(onDismissRequest={deleteTarget=null}, title={Text("删除本地片段？")},
             text={Text("此片段尚未上传，删除后无法恢复。")}, dismissButton={TextButton(onClick={deleteTarget=null}){Text("保留")}},
-            confirmButton={TextButton(onClick={deleteTarget=null;action {sync.discardLocal(id);"已删除"}}){Text("删除")}}) }
+            confirmButton={TextButton(onClick={
+                hidden = hidden + id
+                deleteTarget = null
+                action {
+                    try { sync.discardLocal(id); "已删除" }
+                    catch (error: Exception) { hidden = hidden - id; throw error }
+                }
+            }){Text("删除")}}) }
         noteTarget?.let { id -> AlertDialog(onDismissRequest={noteTarget=null}, title={Text("没有定位，填写备注后才能上传")},
             text={OutlinedTextField(noteText, {noteText=it}, label={Text("备注")})},
             dismissButton={TextButton(onClick={noteTarget=null}){Text("取消")}},

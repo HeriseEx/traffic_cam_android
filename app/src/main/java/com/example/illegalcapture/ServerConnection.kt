@@ -30,6 +30,12 @@ class ServerConnection(context: Context) {
         deviceFile.writeText(id)
         return id
     }
+    @Synchronized fun account(): String {
+        if (off.exists() || !file.baseFile.exists()) return ""
+        return try {
+            JSONObject(file.openRead().use { it.readBytes().toString(Charsets.UTF_8) }).optString("account")
+        } catch (_: Exception) { "" }
+    }
     @Synchronized fun load(): Pair<String, String> {
         if (off.exists()) return "" to ""
         if (!file.baseFile.exists()) return REMOTE to ""
@@ -43,12 +49,18 @@ class ServerConnection(context: Context) {
             endpoint to cipher.doFinal(android.util.Base64.decode(json.getString("token"), 0)).toString(Charsets.UTF_8)
         } catch (_: Exception) { REMOTE to "" }
     }
-    @Synchronized fun save(endpoint: String, token: String) {
+    @Synchronized fun save(endpoint: String, token: String, account: String? = null) {
         BackendClient(endpoint, token)
         off.delete()
+        val kept = when {
+            account != null -> account.trim()
+            token.isBlank() -> ""
+            else -> this.account()
+        }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val value = JSONObject().put("endpoint", endpoint.trim().trimEnd('/'))
+            .put("account", kept)
             .put("iv", android.util.Base64.encodeToString(cipher.iv, android.util.Base64.NO_WRAP))
             .put("token", android.util.Base64.encodeToString(cipher.doFinal(token.toByteArray(Charsets.UTF_8)), android.util.Base64.NO_WRAP))
         val stream = file.startWrite()

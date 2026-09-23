@@ -549,9 +549,11 @@ class MainActivity : ComponentActivity() {
                 Text(if(connection.connected) "● 服务器已连接" else "○ 离线保存 / 正在连接",color=if(connection.connected) Color(0xFF9CE7CE) else Color(0xFFFFCF91),style=MaterialTheme.typography.labelMedium)
                 val latest=connection.records.firstOrNull()
                 val queued = connection.records.count { it.optString("status") == "PENDING_UPLOAD" }
+                val noteCount = connection.records.count { it.optString("status") == "NEED_NOTE" }
                 val activity = if(recording) "● ${if (eventClip) "动态取证" else "重点片段"} ${recordedSeconds}s" else "缓存 ${cacheSeconds}s · 待上传 $queued"
                 Text(ViolationPolicy.mode(violationMode).label, color=Color(0xFFA8C2C9),style=MaterialTheme.typography.labelSmall)
                 Text(activity,color=if(recording) Color(0xFFFFCF91) else Color.White,style=MaterialTheme.typography.labelMedium)
+                if (noteCount > 0) Text("$noteCount 条缺少定位，填写备注后才能上传", color = Color(0xFFFFB74D), style = MaterialTheme.typography.labelMedium)
             }
             if (!menu) {
                 Column(Modifier.align(Alignment.BottomStart).safeDrawingPadding().padding(start=16.dp, end=156.dp, bottom=16.dp).fillMaxWidth()
@@ -697,17 +699,22 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable private fun TrackingControls(onCamera: () -> Unit, onPhoto: () -> Unit, onSample: () -> Unit) {
+        var slidersArmed by remember { mutableStateOf(false) }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(if (slidersArmed) "参数已解锁，改完可锁定" else "进度条已锁定，避免滑动菜单时误触", color = Color(0xFFD5E4E8), style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+            TextButton(onClick = { slidersArmed = !slidersArmed }) { Text(if (slidersArmed) "锁定" else "解锁调整") }
+        }
         Text("丢帧保留 ${(tracker.occlusionMs / 1000f)} 秒", color = Color.White, style = MaterialTheme.typography.bodySmall)
-        Slider(tracker.occlusionMs.toFloat(), { tracker.occlusionMs = it.toLong(); clockTick++ }, valueRange = 1500f..5000f,
+        Slider(tracker.occlusionMs.toFloat(), { tracker.occlusionMs = it.toLong(); clockTick++ }, enabled = slidersArmed, valueRange = 1500f..5000f,
             onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putLong("occlusionMs", tracker.occlusionMs).apply() })
         Text("事件尾部补录 ${incidents.tailMs / 1000f} 秒（另保留 3 秒消失容忍）", color = Color.White, style = MaterialTheme.typography.bodySmall)
-        Slider(incidents.tailMs.toFloat(), { incidents.tailMs = it.toLong(); clockTick++ }, valueRange = 1500f..5000f,
+        Slider(incidents.tailMs.toFloat(), { incidents.tailMs = it.toLong(); clockTick++ }, enabled = slidersArmed, valueRange = 1500f..5000f,
             onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putLong("tailMs", incidents.tailMs).apply() })
         Text("运动阈值 ${(incidents.motionThreshold * 100).toInt()}% 画幅", color = Color.White, style = MaterialTheme.typography.bodySmall)
-        Slider(incidents.motionThreshold, { incidents.motionThreshold = it; clockTick++ }, valueRange = .03f.. .12f,
+        Slider(incidents.motionThreshold, { incidents.motionThreshold = it; clockTick++ }, enabled = slidersArmed, valueRange = .03f.. .12f,
             onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putFloat("motionThreshold", incidents.motionThreshold).apply() })
         Text("置信度阈值 ${(confidence * 100).toInt()}%", color = Color.White, style = MaterialTheme.typography.bodySmall)
-        Slider(confidence, { confidence = it; inferenceThreshold = it }, valueRange = .2f.. .8f, onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putFloat("threshold", confidence).apply() })
+        Slider(confidence, { confidence = it; inferenceThreshold = it }, enabled = slidersArmed, valueRange = .2f.. .8f, onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putFloat("threshold", confidence).apply() })
         Text(result?.let { "处理 ${it.elapsedMs} ms · ${if (live) "相机最多 8 次/秒" else "图片识别"}" } ?: "EfficientDet-Lite0", color = Color(0xFFA8C2C9), style = MaterialTheme.typography.bodySmall)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             OutlinedButton(enabled = !recording && !busy && detector != null, onClick = onCamera) { Text(if (live && running) "暂停" else "相机") }
