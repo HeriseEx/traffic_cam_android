@@ -29,14 +29,11 @@ class DetectionOverlay(context: Context) : View(context) {
         contentDescription = (vehicles.map { label(it) } + lamps.map { lampLabel(it) } + plates.map { plateLabel(it) }).joinToString()
     }
     private fun label(vehicle: Vehicle) =
-        (if (vehicle.trackId > 0) "#${vehicle.trackId} " else "") + vehicle.label +
-            (if (vehicle.predicted) " · 遮挡保留" else " ${(vehicle.score * 100).toInt()}%") +
-            (vehicle.plate?.let { " · $it${if (vehicle.plateConfirmed) " ✓" else " ?"}" } ?: "")
+        vehicle.label + (vehicle.plate?.let { " $it${if (vehicle.plateConfirmed) " ✓" else " ?"}" } ?: "")
     private fun lampLabel(lamp: Lamp) = when (lamp.color) {
         "RED" -> "红灯"; "GREEN" -> "绿灯"; "YELLOW" -> "黄灯"; else -> "信号灯"
-    } + " ${(lamp.score * 100).toInt()}%"
-    private fun plateLabel(plate: PlateHit) =
-        "${plate.text} ${"%.0f".format(plate.confidence * 100)}%"
+    }
+    private fun plateLabel(plate: PlateHit) = plate.text
     private val density = resources.displayMetrics.density
     private val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -54,7 +51,6 @@ class DetectionOverlay(context: Context) : View(context) {
             val color = if (vehicle.predicted) Color.rgb(255, 200, 100) else Color.rgb(74, 255, 175)
             border.color = color
             border.pathEffect = if (vehicle.predicted) android.graphics.DashPathEffect(floatArrayOf(8 * density, 6 * density), 0f) else null
-            vehicle.path.zipWithNext().forEach { (a, b) -> canvas.drawLine(a.x, a.y, b.x, b.y, border) }
             drawBox(canvas, vehicle.box, label(vehicle), color)
         }
         border.pathEffect = null

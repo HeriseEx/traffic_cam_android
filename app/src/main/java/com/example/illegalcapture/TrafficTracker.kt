@@ -20,7 +20,8 @@ data class TrackBox(val left: Float, val top: Float, val right: Float, val botto
 }
 
 data class TrackPoint(val at: Long, val x: Float, val y: Float)
-data class TrackObservation(val label: String, val score: Float, val box: TrackBox, val appearance: List<Float> = emptyList())
+data class TrackObservation(val label: String, val score: Float, val box: TrackBox, val appearance: List<Float> = emptyList(),
+    val signalOff: Boolean? = null)
 data class TrackedVehicle(val id: Long, val observation: TrackObservation, val seenAt: Long,
     val path: List<TrackPoint>, val predicted: Boolean, val plate: String?, val plateConfirmed: Boolean)
 data class TrackPlate(val text: String, val confidence: Float, val box: TrackBox)
@@ -117,30 +118,40 @@ class TrafficTracker(var occlusionMs: Long = 3000) {
 data class LiveIncident(val trackId: Long, val kind: String, val startAt: Long, var endAt: Long,
     var plate: String?, var plateConfirmed: Boolean, val reason: String)
 
-/** Motion in a moving-camera image is a review candidate, never proof of a traffic offence. */
+/** Image motion alone is not an offence. Red-light needs a stop line that stays put. */
 class IncidentWatch(var motionThreshold: Float = .045f, var tailMs: Long = 2500) {
     private val events = linkedMapOf<Pair<Long, String>, LiveIncident>()
-    private var redSince: Long? = null
-    fun clear() { events.clear(); redSince = null }
-    fun update(tracks: List<TrackedVehicle>, at: Long, redStable: Boolean): List<LiveIncident> {
-        if (!redStable) redSince = null else if (redSince == null) redSince = at
+    private val samples = ArrayDeque<RoadRules.Sample>()
+    fun clear() { events.clear(); samples.clear() }
+    fun update(tracks: List<TrackedVehicle>, at: Long, redStable: Boolean, road: RoadFrame = RoadFrame()): List<LiveIncident> {
+        samples.addLast(RoadRules.Sample(at, tracks, road, redStable))
+        while (samples.isNotEmpty() && at - samples.first().at > 2500) samples.removeFirst()
         events.entries.removeAll { at - it.value.endAt > tailMs + 3000 }
+        val reasons = mapOf(
+            "RED_LIGHT" to "红灯期间越过稳定停止线",
+            "SOLID_LINE" to "越过画面中稳定的实线",
+            "EMERGENCY_LANE" to "在最右侧实线以外行驶",
+            "NO_SIGNAL" to "变道时未见转向灯",
+            "OVERTAKE" to "越过虚线并超过相邻车辆",
+            "LATERAL_MOVEMENT" to "同一车辆明显横向移动，需复核车道线及转向灯",
+        )
+        val hits = ArrayList<Pair<Long, String>>()
         for (track in tracks.filter { !it.predicted }) {
             val box = track.observation.box
             if (box.bottom !in .25f.. .96f || box.area !in .003f.. .45f) continue
             val path = track.path.filter { at - it.at <= 2500 }
             if (path.size < 4 || path.last().at - path.first().at < 800) continue
-            val redPath = path.filter { it.at >= (redSince ?: Long.MAX_VALUE) }
-            val redMotion = redPath.size >= 4 && redPath.last().at - redPath.first().at >= 800 &&
-                hypot(redPath.last().x - redPath.first().x, redPath.last().y - redPath.first().y) >= motionThreshold
-            val lateral = abs(path.last().x - path.first().x) >= maxOf(.08f, motionThreshold)
-            for (kind in listOfNotNull(if (redMotion) "RED_LIGHT" else null, if (lateral) "LATERAL_MOVEMENT" else null)) {
-                val key = track.id to kind
-                val from = if (kind == "RED_LIGHT") redPath.first().at else path.first().at
-                val event = events.getOrPut(key) { LiveIncident(track.id, kind, from, at, track.plate, track.plateConfirmed,
-                    if (kind == "RED_LIGHT") "稳定红灯期间同一车辆持续移动，需复核停止线与本向灯色" else "同一车辆明显横向移动，需复核车道线及转向灯") }
-                event.endAt = at; event.plate = track.plate; event.plateConfirmed = track.plateConfirmed
+            if (abs(path.last().x - path.first().x) >= maxOf(.08f, motionThreshold)) hits.add(track.id to "LATERAL_MOVEMENT")
+        }
+        hits.addAll(RoadRules.kinds(samples.toList()))
+        for ((id, kind) in hits) {
+            val track = tracks.firstOrNull { it.id == id } ?: continue
+            val event = events.getOrPut(id to kind) {
+                LiveIncident(id, kind, at, at, track.plate, track.plateConfirmed, reasons[kind] ?: kind)
             }
+            event.endAt = at
+            event.plate = track.plate
+            event.plateConfirmed = track.plateConfirmed
         }
         return events.values.map { it.copy() }
     }

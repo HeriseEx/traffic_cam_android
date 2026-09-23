@@ -1,7 +1,11 @@
 package com.example.illegalcapture
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -9,10 +13,15 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.graphics.RectF
+import android.location.Geocoder
+import android.location.LocationManager
 import android.os.Bundle
 import android.os.SystemClock
 import org.json.JSONObject
 import org.json.JSONArray
+import java.io.File
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -24,16 +33,25 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -48,12 +66,23 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.illegalcapture.ui.theme.IllegalCaptureTheme
 import kotlinx.coroutines.*
-import java.io.File
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        const val SHUTTER_DOWN = "com.example.illegalcapture.action.SHUTTER_DOWN"
+        const val SHUTTER_UP = "com.example.illegalcapture.action.SHUTTER_UP"
+    }
+    private val shutterActions = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                SHUTTER_DOWN -> onShutterDown()
+                SHUTTER_UP -> onShutterUp()
+            }
+        }
+    }
     private val worker = Executors.newSingleThreadExecutor()
     private val destroyed = AtomicBoolean(false)
     private val frameBusy = AtomicBoolean(false)
@@ -71,7 +100,6 @@ class MainActivity : ComponentActivity() {
     private var generation = 0
     private var feed: CameraFeed? = null
     private var menu by mutableStateOf(false)
-    private var options by mutableStateOf(false)
     private var showBoxes by mutableStateOf(true)
     private var voiceEnabled by mutableStateOf(false)
     private var voiceStatus by mutableStateOf("语音未开启")
@@ -83,7 +111,16 @@ class MainActivity : ComponentActivity() {
     private var currentIncidents by mutableStateOf<List<LiveIncident>>(emptyList())
     private val captureEvents = linkedMapOf<String, LiveIncident>()
     private val savedEvents = mutableMapOf<String, Long>()
-    private var automatic by mutableStateOf(true)
+    private var violationMode by mutableStateOf("AUTO")
+    private var resolutionId by mutableStateOf("1080")
+    private var offeredTiers by mutableStateOf(RecordingTier.recordable())
+    private var fingerDown = false
+    private var wantSpoken = false
+    private var parkingTarget by mutableStateOf<String?>(null)
+    private var spotPlates by mutableStateOf<Map<String, Float>>(emptyMap())
+    private var frontPlates by mutableStateOf<Map<String, Float>>(emptyMap())
+    private var spotFile: File? = null
+    private var frontFile: File? = null
     private var cacheSeconds by mutableIntStateOf(0)
     private var lastSignalAt = 0L
     private var lastLocalSignalAt = 0L
@@ -99,11 +136,14 @@ class MainActivity : ComponentActivity() {
     private var liveSignal by mutableStateOf("UNKNOWN")
     private var liveSignalStable by mutableStateOf(false)
     private val sync by lazy { TaskSync.get(this) }
-    private val voice by lazy { VoiceMarker(this, { voiceStatus = it }, { mark("voice") }) }
+    private val voice by lazy { VoiceMarker(this, { voiceStatus = it }, { if (!recording) startSpoken() }) }
     private var orientationPreference = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val shutterFilter = IntentFilter().apply { addAction(SHUTTER_DOWN); addAction(SHUTTER_UP) }
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(shutterActions, shutterFilter, RECEIVER_NOT_EXPORTED)
+        else registerReceiver(shutterActions, shutterFilter)
         enableEdgeToEdge(SystemBarStyle.dark(android.graphics.Color.TRANSPARENT), SystemBarStyle.dark(android.graphics.Color.TRANSPARENT))
         val prefs = getPreferences(MODE_PRIVATE)
         confidence = prefs.getFloat("threshold", .4f).coerceIn(.2f,.8f)
@@ -112,7 +152,8 @@ class MainActivity : ComponentActivity() {
         livePlateEnabled = prefs.getBoolean("livePlate", true)
         clipSeconds = prefs.getInt("clipSeconds", 15).let { if (it in listOf(10, 15, 30)) it else 15 }
         showBoxes = prefs.getBoolean("showBoxes", true)
-        automatic = prefs.getBoolean("automatic", true)
+        violationMode = ViolationPolicy.mode(prefs.getString("violationMode", "AUTO") ?: "AUTO").id
+        resolutionId = RecordingTier.recordable().firstOrNull { it.id == prefs.getString("resolution", "1080") }?.id ?: "1080"
         tracker.occlusionMs = prefs.getLong("occlusionMs", 3000).coerceIn(1500, 5000)
         incidents.motionThreshold = prefs.getFloat("motionThreshold", .045f).coerceIn(.03f, .12f)
         incidents.tailMs = prefs.getLong("tailMs", 2500).coerceIn(1500, 5000)
@@ -209,12 +250,16 @@ class MainActivity : ComponentActivity() {
         } else if (at - lastSignalAt > 1500) {
             signalHold.clear(); liveSignal = "UNKNOWN"; liveSignalStable = false
         }
-        currentIncidents = incidents.update(tracks, at, liveSignalStable && liveSignal == "RED")
+        currentIncidents = incidents.update(tracks, at, liveSignalStable && liveSignal == "RED", detection.road)
         if (recording && !captureFinalizing) currentIncidents.forEach { event ->
             if (captureEvents.size < 16 || incidentKey(event) in captureEvents) captureEvents[incidentKey(event)] = event.copy()
         }
-        if (!recording && automatic && live && running) {
-            val fresh = currentIncidents.filter { at - it.endAt < 1000 && at - (savedEvents[incidentKey(it)] ?: -10000) > 3000 }
+        val mode = ViolationPolicy.mode(violationMode)
+        if (!recording && !mode.parking && live && running) {
+            val fresh = currentIncidents.filter {
+                at - it.endAt < incidents.tailMs + 3_000 && at - (savedEvents[incidentKey(it)] ?: -10000) > 3000 &&
+                    ViolationPolicy.autoReady(violationMode, it.kind, it.plate, it.plateConfirmed)
+            }
             if (fresh.isNotEmpty()) mark("automatic", fresh)
         }
         maybeFinishClip(at)
@@ -239,7 +284,7 @@ class MainActivity : ComponentActivity() {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LOCKED
         eventClip = trigger == "automatic"
         val note = when (trigger) { "voice" -> "开始标记"; "automatic" -> "行车轨迹疑似事件，待服务器复核"; else -> "手动标记" }
-        val from = if (events.isEmpty()) now - 10_000 else events.minOf { it.startAt } - 3000
+        val from = if (events.isEmpty()) now - 10_000 else events.minOf { it.startAt } - ViolationPolicy.LEAD_MS
         val started = camera.record(file, if (eventClip) 65 else clipSeconds, { recordedSeconds = it }, { completed, error ->
             val timing = camera.lastClipTiming
             val evidence = JSONArray()
@@ -254,31 +299,205 @@ class MainActivity : ComponentActivity() {
                 .put("captured_at", (System.currentTimeMillis() - (SystemClock.elapsedRealtime() - it.startMs)) / 1000.0)
                 .put("duration_ms", it.endMs - it.startMs).put("recording_gaps_ms", it.gapsMs)
                 .put("prebuffer_truncated", it.startMs > from + 500) }
-            val candidate = if (captureEvents.values.any { it.kind == "RED_LIGHT" }) "RED_LIGHT" else "UNKNOWN"
+            val candidate = captureEvents.values.firstOrNull { it.kind in ViolationPolicy.drivingKinds }?.kind ?: "UNKNOWN"
+            val plated = captureEvents.values.any { ViolationPolicy.autoReady(violationMode, it.kind, it.plate, it.plateConfirmed) }
             recording = false; eventClip = false; captureFinalizing = false; requestedOrientation = orientationPreference
-            if (completed != null) {
-                // Application repository outlives Activity destruction while finalized evidence enters the durable queue.
-                val repository = sync
-                CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        repository.enqueue(completed, trigger, note, candidate, details)
-                        withContext(Dispatchers.Main) { if (!destroyed.get()) status = "片段已保存 · 自动上传与复核中" }
-                        repository.tick()
-                    } catch (e: Exception) {
-                        withContext(Dispatchers.Main) { if (!destroyed.get()) status = "视频已保留，稍后恢复入队：${e.message}" }
-                    }
-                }
-            } else status = error ?: "录像失败"
+            if (completed != null && plated) {
+                keepClip(completed, trigger, note, candidate, details, "片段已保存 · 自动上传与复核中")
+            } else {
+                completed?.delete()
+                status = if (completed == null) error ?: "录像失败" else "未识别车牌，已丢弃"
+            }
+            if (wantSpoken && fingerDown) startSpoken()
         }, startAtMs = from)
         if (!started) { recording = false; eventClip = false; requestedOrientation = orientationPreference; status = "缓存正在准备，请稍后标记" }
         else { status = if (trigger == "automatic") "疑似事件取证中 · 持续跟踪并动态延长" else "正在录制重点片段"; menu = false }
     }
 
+    private fun onShutterDown() {
+        if (ViolationPolicy.mode(violationMode).parking) return
+        fingerDown = true
+        if (recording && eventClip) { wantSpoken = true; captureFinalizing = true; feed?.stopRecording() }
+        else if (!recording) startSpoken()
+    }
+
+    private fun onShutterUp() {
+        fingerDown = false
+        if (recording && !eventClip) { captureFinalizing = true; feed?.stopRecording() }
+        else wantSpoken = false
+    }
+
+    private fun startSpoken() {
+        if (recording || !live || !running || !cameraPermission) return
+        val camera = feed ?: return
+        if (sync.clips.usableSpace < 150L * 1024 * 1024) { status = "空间不足，请先处理待上传视频"; return }
+        val file = File(sync.clips, "${UUID.randomUUID()}.mp4")
+        recording = true; recordedSeconds = 0; captureFinalizing = false; eventClip = false; wantSpoken = false
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LOCKED
+        val started = camera.record(file, 65, { recordedSeconds = it }, { completed, error ->
+            val timing = camera.lastClipTiming
+            val duration = timing?.let { it.endMs - it.startMs } ?: 0L
+            recording = false; captureFinalizing = false; requestedOrientation = orientationPreference
+            if (completed != null && ViolationPolicy.holdKept(duration)) {
+                val details = JSONObject().put("camera_mode", "moving").put("incidents", JSONArray())
+                    .put("captured_at", System.currentTimeMillis() / 1000.0).put("duration_ms", duration).put("recording_gaps_ms", 0)
+                keepClip(completed, "manual", "人工口述", "UNKNOWN", details, "人工片段已保存")
+            } else {
+                completed?.delete()
+                status = if (completed == null) error ?: "录像失败" else "不足 3 秒，已丢弃"
+            }
+        }, spokenCapture = true)
+        if (!started) { recording = false; requestedOrientation = orientationPreference; status = "缓存正在准备，请稍后标记" }
+        else { status = "正在录音录像，松开后提交"; menu = false }
+    }
+
+    private fun keepClip(file: File, trigger: String, note: String, candidate: String, details: JSONObject?, done: String) {
+        val repository = sync
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val saved = repository.enqueue(file, trigger, note, candidate, details, place(), "")
+                withContext(Dispatchers.Main) {
+                    if (!destroyed.get()) status = if (saved.optString("status") == "NEED_NOTE") "没有定位，请在记录里填写备注后再上传" else done
+                }
+                repository.tick()
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { if (!destroyed.get()) status = "视频已保留，稍后恢复入队：${e.message}" }
+            }
+        }
+    }
+
+    private fun place(): JSONObject? {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return null
+        val manager = getSystemService(LocationManager::class.java)
+        val fix = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER).firstNotNullOfOrNull { provider ->
+            try { manager.getLastKnownLocation(provider) } catch (_: SecurityException) { null }
+        } ?: return null
+        val address = try {
+            if (!Geocoder.isPresent()) null
+            else Geocoder(this).getFromLocation(fix.latitude, fix.longitude, 1)?.firstOrNull()?.getAddressLine(0)
+        } catch (_: Exception) { null } ?: String.format(java.util.Locale.US, "%.5f, %.5f", fix.latitude, fix.longitude)
+        return JSONObject().put("latitude", fix.latitude).put("longitude", fix.longitude).put("address", address)
+    }
+
+    private fun shootParking(target: String) {
+        parkingTarget = target
+        feed?.takeStill()
+        status = if (target == "spot") "请保持车尾画面" else "请保持车头画面"
+    }
+
+    private fun onParkingStill(jpeg: ByteArray) {
+        val target = parkingTarget ?: return
+        parkingTarget = null
+        val plates = mutableMapOf<String, Float>()
+        for (vehicle in result?.vehicles.orEmpty()) {
+            val plate = vehicle.plate?.takeIf { vehicle.plateConfirmed && it.isNotBlank() } ?: continue
+            val area = vehicle.box.width() * vehicle.box.height()
+            if (area > (plates[plate] ?: 0f)) plates[plate] = area
+        }
+        if (plates.isEmpty()) { status = "没有识别到车牌，请重拍"; return }
+        val file = File(cacheDir, "park-$target.jpg")
+        file.writeBytes(jpeg)
+        if (target == "spot") { spotFile = file; spotPlates = plates.toMap() } else { frontFile = file; frontPlates = plates.toMap() }
+        status = ViolationPolicy.parkingBlock(spotPlates, frontPlates) ?: "车牌 ${ViolationPolicy.sharedPlate(spotPlates, frontPlates)} 一致，可以提交"
+    }
+
+    private fun submitParking() {
+        val block = ViolationPolicy.parkingBlock(spotPlates, frontPlates)
+        val spot = spotFile; val front = frontFile
+        val plate = ViolationPolicy.sharedPlate(spotPlates, frontPlates)
+        if (block != null || spot == null || front == null || plate == null) { status = block ?: "请先拍两张原片"; return }
+        val zip = File(sync.clips, "${UUID.randomUUID()}.mp4")
+        ZipOutputStream(zip.outputStream()).use { out ->
+            for ((name, file) in listOf("spot.jpg" to spot, "front.jpg" to front)) {
+                out.putNextEntry(ZipEntry(name)); file.inputStream().use { it.copyTo(out) }; out.closeEntry()
+            }
+        }
+        val incidents = JSONArray()
+        listOf(0, 1).forEach { index ->
+            incidents.put(JSONObject().put("track_id", 1).put("kind", "ILLEGAL_PARKING")
+                .put("start_ms", index).put("end_ms", index + 1).put("plate", plate).put("plate_confirmed", true))
+        }
+        val details = JSONObject().put("camera_mode", "moving").put("incidents", incidents)
+            .put("captured_at", System.currentTimeMillis() / 1000.0).put("duration_ms", 2).put("recording_gaps_ms", 0)
+        keepClip(zip, "manual", "乱停乱放", "ILLEGAL_PARKING", details, "两张原片已保存")
+        spotPlates = emptyMap(); frontPlates = emptyMap(); spotFile = null; frontFile = null
+    }
+
+    @Composable private fun HoldButton(modifier: Modifier = Modifier) {
+        val label = when {
+            ViolationPolicy.mode(violationMode).parking -> "拍照模式"
+            recording && !eventClip -> "松开提交"
+            recording -> "自动片段录制中"
+            else -> "按住取证"
+        }
+        Box(modifier.background(if (recording && !eventClip) Color(0xFFB71C1C) else Color.White.copy(alpha = .35f), CircleShape)
+            .pointerInput(violationMode) {
+                awaitEachGesture {
+                    awaitFirstDown()
+                    onShutterDown()
+                    waitForUpOrCancellation()
+                    onShutterUp()
+                }
+            }.padding(horizontal = 18.dp, vertical = 14.dp), contentAlignment = Alignment.Center) {
+            Text(label, color = Color.White)
+        }
+    }
+
+    @Composable private fun ParkingShots() {
+        val ready = ViolationPolicy.parkingBlock(spotPlates, frontPlates) == null
+        val shared = ViolationPolicy.sharedPlate(spotPlates, frontPlates)
+        val hint = when {
+            spotPlates.isEmpty() && frontPlates.isEmpty() -> "先拍车尾，再拍车头。拍到车牌后按钮变绿，两张都有同一车牌再点确认提交。"
+            shared != null -> "车牌 $shared 两张都有。请点绿色的确认提交。"
+            spotPlates.isNotEmpty() && frontPlates.isNotEmpty() -> ViolationPolicy.parkingBlock(spotPlates, frontPlates) ?: "请继续拍摄"
+            spotPlates.isEmpty() -> "车头 ${frontPlates.keys.joinToString("·")}。请再拍车尾。"
+            else -> "车尾 ${spotPlates.keys.joinToString("·")}。请再拍车头。"
+        }
+        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(hint, Modifier.widthIn(max = 320.dp), color = if (ready) Color(0xFF9CE7CE) else Color.White, style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ParkingShotButton("车尾", spotPlates) { shootParking("spot") }
+                ParkingShotButton("车头", frontPlates) { shootParking("front") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    val plates = spotPlates; val file = spotFile
+                    spotPlates = frontPlates; spotFile = frontFile; frontPlates = plates; frontFile = file
+                    status = ViolationPolicy.parkingBlock(spotPlates, frontPlates) ?: "已调换顺序"
+                }, enabled = spotFile != null && frontFile != null) { Text("调换顺序") }
+                Button(onClick = { submitParking() }, enabled = ready, colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF1B8A4A), disabledContainerColor = Color(0xFF455A64),
+                    contentColor = Color.White, disabledContentColor = Color.White.copy(alpha = .7f),
+                )) { Text(if (ready) "确认提交" else "等待两张一致") }
+            }
+        }
+    }
+
+    @Composable private fun ParkingShotButton(name: String, plates: Map<String, Float>, onClick: () -> Unit) {
+        val taken = plates.isNotEmpty()
+        val label = when (plates.size) {
+            0 -> "拍$name"
+            1 -> "$name ${plates.keys.first()}"
+            else -> "$name ${plates.keys.joinToString("·")}"
+        }
+        Button(onClick = onClick, enabled = live && running && cameraPermission, colors = ButtonDefaults.buttonColors(
+            containerColor = if (taken) Color(0xFF1B8A4A) else Color(0xFF546E7A),
+            contentColor = Color.White,
+        )) { Text(label) }
+    }
+
     @Composable private fun Screen() {
         val connection by sync.state.collectAsState()
         val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val captureMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+        val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            if (!microphoneGranted()) captureMic.launch(Manifest.permission.RECORD_AUDIO)
+        }
         val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-            cameraPermission = it; if (!it) status = "未获得相机权限，可用图片识别"
+            cameraPermission = it
+            if (it) locationPermission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+            else status = "未获得相机权限，可用图片识别"
         }
         val microphone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
             voiceEnabled = it; getPreferences(MODE_PRIVATE).edit().putBoolean("voiceEnabled",it).apply()
@@ -293,7 +512,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        BackHandler(menu || options) { if (options) options=false else menu=false }
+        BackHandler(menu) { menu=false }
 
         Box(Modifier.fillMaxSize().background(Color.Black)) {
             val ready = detector
@@ -301,7 +520,11 @@ class MainActivity : ComponentActivity() {
                 AndroidView(modifier=Modifier.fillMaxSize(),factory={ context ->
                     CameraFeed(context,this@MainActivity,worker,ready,{inferenceThreshold},{ detection, at ->
                         onVehicles(detection, at)
-                    },{status=it},{ jpeg, at -> recognizeFrame(jpeg, at) }).also { feed=it }
+                    },{status=it},{ jpeg, at -> onParkingStill(jpeg); recognizeFrame(jpeg, at) }, resolutionId, { id ->
+                        resolutionId = id
+                        offeredTiers = feed?.supportedTiers()?.ifEmpty { RecordingTier.recordable() } ?: RecordingTier.recordable()
+                        getPreferences(MODE_PRIVATE).edit().putString("resolution", id).apply()
+                    }).also { feed=it }
                 },update={it.boxes(showBoxes)})
                 DisposableEffect(Unit) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -327,23 +550,27 @@ class MainActivity : ComponentActivity() {
                 val latest=connection.records.firstOrNull()
                 val queued = connection.records.count { it.optString("status") == "PENDING_UPLOAD" }
                 val activity = if(recording) "● ${if (eventClip) "动态取证" else "重点片段"} ${recordedSeconds}s" else "缓存 ${cacheSeconds}s · 待上传 $queued"
-                Text(if (automatic) "自动取证已开启" else "手动取证模式", color=Color(0xFFA8C2C9),style=MaterialTheme.typography.labelSmall)
+                Text(ViolationPolicy.mode(violationMode).label, color=Color(0xFFA8C2C9),style=MaterialTheme.typography.labelSmall)
                 Text(activity,color=if(recording) Color(0xFFFFCF91) else Color.White,style=MaterialTheme.typography.labelMedium)
             }
             if (!menu) {
                 Column(Modifier.align(Alignment.BottomStart).safeDrawingPadding().padding(start=16.dp, end=156.dp, bottom=16.dp).fillMaxWidth()
                     .background(Color.Black.copy(alpha=.58f)).padding(10.dp),verticalArrangement=Arrangement.spacedBy(3.dp)) {
-                    val types=result?.vehicles?.map{it.label}?.distinct()?.joinToString(" / ").orEmpty()
+                    val types = result?.vehicles?.groupingBy { it.label }?.eachCount()
+                        ?.entries?.joinToString(" / ") { "${it.key} ${it.value}" }.orEmpty()
                     Text("车辆：${types.ifBlank{"未检出"}}",color=Color.White,style=MaterialTheme.typography.bodySmall)
                     val targets = result?.vehicles.orEmpty()
                     val livePlates = if (live) targets.filter { it.plate != null }.take(3).joinToString(" · ") {
-                        "#${it.trackId} ${it.plate}${if (it.plateConfirmed) " ✓" else " 待确认"}"
+                        "${it.plate}${if (it.plateConfirmed) " ✓" else " ?"}"
                     } else plateHits.joinToString(" · ") { it.text }
                     Text("车牌：${livePlates.ifBlank { if (livePlateEnabled) "等待清晰车牌" else "实时车牌已关闭" }}", color=Color.White,style=MaterialTheme.typography.bodySmall)
                     Text("信号灯：${signalLabel(liveSignal, liveSignalStable)}",color=if(liveSignal=="RED" && liveSignalStable) Color(0xFFFF8A80) else Color.White,style=MaterialTheme.typography.bodySmall)
+                    if ((violationMode == "AUTO" || violationMode == "RED_LIGHT") && liveSignal == "RED" && liveSignalStable &&
+                        currentIncidents.none { it.kind == "RED_LIGHT" })
+                        Text("红灯已稳定。上传还需确认车牌，且车底越过停住的停止线。", color = Color(0xFFFFCF91), style = MaterialTheme.typography.bodySmall)
                     val activeEvents = currentIncidents.filter { clockTick - it.endAt < 5500 }
-                    Text(if (activeEvents.isEmpty()) "${targets.count { !it.predicted }} 辆跟踪中 · ${targets.count { it.predicted }} 辆遮挡保留" else
-                        activeEvents.take(2).joinToString(" · ") { "#${it.trackId} ${if (it.kind == "RED_LIGHT") "红灯期间运动" else "横向移动"} · 待复核" },
+                    if (activeEvents.isNotEmpty()) Text(
+                        activeEvents.take(2).joinToString(" · ") { it.reason },
                         color=Color(0xFFECDCA9),style=MaterialTheme.typography.bodySmall)
 
                 }
@@ -352,89 +579,141 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.align(Alignment.BottomEnd).safeDrawingPadding().padding(16.dp), horizontalAlignment=Alignment.End,
                     verticalArrangement=Arrangement.spacedBy(8.dp)) {
                     FilledTonalButton(onClick={menu=true}) { Text("操作菜单") }
-                    Button(onClick={if(recording) { captureFinalizing=true;feed?.stopRecording() } else mark("manual")},
-                        enabled=detector!=null && live && running && cameraPermission) { Text(if(recording) "结束片段" else "标记重点") }
+                    if (ViolationPolicy.mode(violationMode).parking) ParkingShots() else HoldButton()
                 }
             }
-            if(menu) {
-                Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(Color(0xEE101820))
-                    .safeDrawingPadding().padding(horizontal=16.dp,vertical=10.dp),verticalArrangement=Arrangement.spacedBy(7.dp)) {
-                    Row(Modifier.fillMaxWidth(),horizontalArrangement=Arrangement.SpaceBetween,verticalAlignment=Alignment.CenterVertically) {
-                        Text("车辆识别",style=MaterialTheme.typography.titleMedium,color=Color.White)
-                        TextButton(onClick={menu=false}) { Text("隐藏菜单") }
+            if (menu) CaptureMenu(landscape,
+                onVoice = { if (voiceEnabled) { voiceEnabled = false; voice.stop(); voiceStatus = "语音未开启"; getPreferences(MODE_PRIVATE).edit().putBoolean("voiceEnabled", false).apply() } else microphone.launch(Manifest.permission.RECORD_AUDIO) },
+                onServer = { startActivity(Intent(this@MainActivity, BackendActivity::class.java)) },
+                onPhoto = { picker.launch("image/*") },
+                onSample = { showPhoto { assets.open("traffic.jpg").use { BitmapFactory.decodeStream(it) } } },
+                onCamera = {
+                    generation++; result = null; photo = null; resetTracking()
+                    running = if (live && cameraPermission) !running else true; live = true
+                    status = if (running) "等待相机画面…" else "相机已暂停"
+                    if (running && !cameraPermission) permission.launch(Manifest.permission.CAMERA)
+                })
+        }
+    }
+
+    @Composable private fun BoxScope.CaptureMenu(
+        landscape: Boolean,
+        onVoice: () -> Unit,
+        onServer: () -> Unit,
+        onPhoto: () -> Unit,
+        onSample: () -> Unit,
+        onCamera: () -> Unit,
+    ) {
+        Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+            .then(if (landscape) Modifier.fillMaxHeight() else Modifier.fillMaxHeight(.72f))
+            .clipToBounds()
+            .background(Color(0xFF101820))
+            .border(2.dp, Color(0xFF9CE7CE))) {
+            Column(Modifier.fillMaxSize().safeDrawingPadding().padding(12.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("监看菜单", style = MaterialTheme.typography.titleMedium, color = Color.White)
+                    TextButton(onClick = { menu = false }) { Text("隐藏菜单") }
+                }
+                Column(Modifier.weight(1f).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(status, color = Color.White, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                    Text(voiceStatus, color = Color(0xFFA8C2C9), style = MaterialTheme.typography.bodySmall)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (ViolationPolicy.mode(violationMode).parking) ParkingShots() else HoldButton()
+                        OutlinedButton(onClick = onVoice) { Text(if (voiceEnabled) "关闭语音" else "语音标记") }
+                        OutlinedButton(onClick = onServer, enabled = !recording) { Text("服务器与记录") }
                     }
-                    Text(status,color=Color.White,style=MaterialTheme.typography.bodySmall,maxLines=2)
-                    Text(voiceStatus,color=Color(0xFFA8C2C9),style=MaterialTheme.typography.bodySmall)
-                    if(landscape) {
-                        Row(horizontalArrangement=Arrangement.spacedBy(9.dp)) {
-                            Button(onClick={if(recording)feed?.stopRecording() else mark("manual")},enabled=detector!=null) { Text(if(recording) "结束片段" else "标记重点") }
-                            OutlinedButton(onClick={if(voiceEnabled){voiceEnabled=false;voice.stop();voiceStatus="语音未开启";getPreferences(MODE_PRIVATE).edit().putBoolean("voiceEnabled",false).apply()} else microphone.launch(Manifest.permission.RECORD_AUDIO)}) { Text(if(voiceEnabled) "关闭语音" else "语音标记") }
-                            OutlinedButton(onClick={startActivity(Intent(this@MainActivity,BackendActivity::class.java))},enabled=!recording) { Text("服务器与记录") }
-                            OutlinedButton(onClick={options=true}) { Text("更多设置") }
+                    if (landscape) {
+                        Row(Modifier.fillMaxWidth().drawBehind {
+                            val x = size.width * 1.15f / 2.15f
+                            drawLine(Color(0xFF9CE7CE), Offset(x, 0f), Offset(x, size.height), strokeWidth = 2.dp.toPx())
+                        }, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                            Column(Modifier.weight(1.15f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                MenuBlock("违法模式") { ModeChips() }
+                            }
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                MenuBlock("分辨率") { ResolutionChips() }
+                                MenuBlock("画面") { DirectionChips(); PictureToggles() }
+                            }
                         }
                     } else {
-                        Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                            Button(modifier=Modifier.weight(1f),enabled=detector!=null,onClick={if(recording)feed?.stopRecording() else mark("manual")}) { Text(if(recording) "结束片段" else "标记重点") }
-                            OutlinedButton(modifier=Modifier.weight(1f),onClick={if(voiceEnabled){voiceEnabled=false;voice.stop();voiceStatus="语音未开启";getPreferences(MODE_PRIVATE).edit().putBoolean("voiceEnabled",false).apply()} else microphone.launch(Manifest.permission.RECORD_AUDIO)}) { Text(if(voiceEnabled) "关闭语音" else "语音标记") }
-                        }
-                        Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(modifier=Modifier.weight(1f),enabled=!recording,onClick={startActivity(Intent(this@MainActivity,BackendActivity::class.java))}) { Text("服务器与记录") }
-                            OutlinedButton(modifier=Modifier.weight(1f),onClick={options=true}) { Text("更多设置") }
-                        }
+                        MenuBlock("违法模式") { ModeChips() }
+                        MenuBlock("分辨率") { ResolutionChips() }
+                        MenuBlock("画面") { DirectionChips(); PictureToggles() }
                     }
+                    MenuBlock("跟踪") { TrackingControls(onCamera, onPhoto, onSample) }
                 }
             }
         }
-        if(options) AlertDialog(onDismissRequest={options=false},title={Text("画面与筛查设置")},confirmButton={TextButton(onClick={options=false}){Text("完成")}},text={
-            Column(Modifier.verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(10.dp)) {
-                Row(verticalAlignment=Alignment.CenterVertically) {
-                    Switch(automatic, { automatic=it;getPreferences(MODE_PRIVATE).edit().putBoolean("automatic",it).apply() })
-                    Text("自动发现疑似事件并上传")
-                }
-                Text("自动片段从动作开始前的缓存提取，随动作延长；短暂遮挡保留身份，事件结束后补录。长事件按容量分段。")
-                Text("手动 / 语音标记后补录")
-                Row(horizontalArrangement=Arrangement.spacedBy(6.dp)) {
-                    listOf(10, 15, 30).forEach { seconds ->
-                        FilterChip(selected=clipSeconds==seconds, enabled=!recording, onClick={
-                            clipSeconds=seconds
-                            getPreferences(MODE_PRIVATE).edit().putInt("clipSeconds", seconds).apply()
-                        }, label={Text("${seconds}秒")})
-                    }
-                }
-                Text("画面方向")
-                Row(horizontalArrangement=Arrangement.spacedBy(6.dp)) {
-                    listOf("横屏" to ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,"竖屏" to ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT,"自动" to ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR).forEach { (label,value) ->
-                        FilterChip(selected=orientationPreference==value,enabled=!recording,onClick={orientationPreference=value;requestedOrientation=value;getPreferences(MODE_PRIVATE).edit().putInt("orientation",value).apply()},label={Text(label)})
-                    }
-                }
-                Row(verticalAlignment=Alignment.CenterVertically) { Checkbox(showBoxes,{showBoxes=it;getPreferences(MODE_PRIVATE).edit().putBoolean("showBoxes",it).apply()});Text("显示车辆识别框和车牌") }
-                Row(verticalAlignment=Alignment.CenterVertically) { Checkbox(livePlateEnabled,{livePlateEnabled=it;if(!it){tracker.clearPlates();setPlates(emptyList())};getPreferences(MODE_PRIVATE).edit().putBoolean("livePlate",it).apply()});Text("连接后实时识别车牌") }
-                Text("车牌按轨迹累计确认；网络较慢时自动降低请求频率。离线也会保存疑似片段，恢复连接后自动上传。移动镜头不能仅凭位移认定违法。",style=MaterialTheme.typography.bodySmall)
-                Text("遮挡保留 ${(tracker.occlusionMs / 1000f)} 秒")
-                Slider(tracker.occlusionMs.toFloat(), { tracker.occlusionMs=it.toLong();clockTick++ }, valueRange=1500f..5000f,
-                    onValueChangeFinished={getPreferences(MODE_PRIVATE).edit().putLong("occlusionMs",tracker.occlusionMs).apply()})
-                Text("事件尾部补录 ${incidents.tailMs / 1000f} 秒（另保留 3 秒消失容忍）")
-                Slider(incidents.tailMs.toFloat(), { incidents.tailMs=it.toLong();clockTick++ }, valueRange=1500f..5000f,
-                    onValueChangeFinished={getPreferences(MODE_PRIVATE).edit().putLong("tailMs",incidents.tailMs).apply()})
-                Text("运动阈值 ${(incidents.motionThreshold * 100).toInt()}% 画幅")
-                Slider(incidents.motionThreshold, { incidents.motionThreshold=it;clockTick++ }, valueRange=.03f.. .12f,
-                    onValueChangeFinished={getPreferences(MODE_PRIVATE).edit().putFloat("motionThreshold",incidents.motionThreshold).apply()})
-                Text("置信度阈值 ${(confidence*100).toInt()}%")
-                Slider(confidence,{confidence=it;inferenceThreshold=it},valueRange=.2f.. .8f,onValueChangeFinished={getPreferences(MODE_PRIVATE).edit().putFloat("threshold",confidence).apply()})
-                Text(result?.let{"处理 ${it.elapsedMs} ms · ${if(live) "相机最多 8 次/秒" else "图片识别"}"}?:"EfficientDet-Lite0",style=MaterialTheme.typography.bodySmall)
-                Row(horizontalArrangement=Arrangement.spacedBy(5.dp)) {
-                    OutlinedButton(enabled=!recording&&!busy&&detector!=null,onClick={
-                        generation++;result=null;photo=null;resetTracking()
-                        running=if(live&&cameraPermission)!running else true;live=true
-                        status=if(running)"等待相机画面…" else "相机已暂停"
-                        if(running&&!cameraPermission)permission.launch(Manifest.permission.CAMERA)
-                        options=false
-                    }) { Text(if(live&&running) "暂停" else "相机") }
-                    OutlinedButton(enabled=!recording&&!busy&&detector!=null,onClick={picker.launch("image/*");options=false}) { Text("选图片") }
-                    OutlinedButton(enabled=!recording&&!busy&&detector!=null,onClick={showPhoto{assets.open("traffic.jpg").use{BitmapFactory.decodeStream(it)}};options=false}) { Text("测试图") }
-                }
+    }
+
+    @Composable private fun MenuBlock(title: String, content: @Composable ColumnScope.() -> Unit) {
+        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, color = Color(0xFF9CE7CE), style = MaterialTheme.typography.titleSmall)
+            HorizontalDivider(thickness = 2.dp, color = Color(0xFF9CE7CE))
+            content()
+        }
+    }
+
+    @Composable private fun ModeChips() {
+        Text("Auto 不含乱停乱放。没有车牌的自动线索不会上传。", color = Color(0xFFD5E4E8), style = MaterialTheme.typography.bodySmall)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            ViolationPolicy.modes.forEach { mode ->
+                FilterChip(selected = violationMode == mode.id, enabled = !recording, onClick = {
+                    if (ViolationPolicy.mode(violationMode).parking && !mode.parking) status = "监看中"
+                    violationMode = mode.id
+                    getPreferences(MODE_PRIVATE).edit().putString("violationMode", mode.id).apply()
+                }, label = { Text(mode.label) })
             }
-        })
+        }
+    }
+
+    @Composable private fun ResolutionChips() {
+        Text("旁边是 50MB 内大约还能录的秒数。违法模式不随分辨率改变。", color = Color(0xFFD5E4E8), style = MaterialTheme.typography.bodySmall)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            offeredTiers.forEach { tier ->
+                FilterChip(selected = resolutionId == tier.id, enabled = !recording, onClick = {
+                    resolutionId = tier.id
+                    getPreferences(MODE_PRIVATE).edit().putString("resolution", tier.id).apply()
+                    feed?.setTier(tier.id)
+                }, label = { Text("${tier.label} · 约${RecordingTier.maxSeconds(tier)}秒") })
+            }
+        }
+    }
+
+    @Composable private fun DirectionChips() {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("横屏" to ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE, "竖屏" to ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT, "自动" to ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR).forEach { (label, value) ->
+                FilterChip(selected = orientationPreference == value, enabled = !recording, onClick = {
+                    orientationPreference = value; requestedOrientation = value
+                    getPreferences(MODE_PRIVATE).edit().putInt("orientation", value).apply()
+                }, label = { Text(label) })
+            }
+        }
+    }
+
+    @Composable private fun PictureToggles() {
+        Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(showBoxes, { showBoxes = it; getPreferences(MODE_PRIVATE).edit().putBoolean("showBoxes", it).apply() }); Text("显示识别框和车牌", color = Color.White) }
+        Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(livePlateEnabled, { livePlateEnabled = it; if (!it) { tracker.clearPlates(); setPlates(emptyList()) }; getPreferences(MODE_PRIVATE).edit().putBoolean("livePlate", it).apply() }); Text("实时识别车牌", color = Color.White) }
+    }
+
+    @Composable private fun TrackingControls(onCamera: () -> Unit, onPhoto: () -> Unit, onSample: () -> Unit) {
+        Text("丢帧保留 ${(tracker.occlusionMs / 1000f)} 秒", color = Color.White, style = MaterialTheme.typography.bodySmall)
+        Slider(tracker.occlusionMs.toFloat(), { tracker.occlusionMs = it.toLong(); clockTick++ }, valueRange = 1500f..5000f,
+            onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putLong("occlusionMs", tracker.occlusionMs).apply() })
+        Text("事件尾部补录 ${incidents.tailMs / 1000f} 秒（另保留 3 秒消失容忍）", color = Color.White, style = MaterialTheme.typography.bodySmall)
+        Slider(incidents.tailMs.toFloat(), { incidents.tailMs = it.toLong(); clockTick++ }, valueRange = 1500f..5000f,
+            onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putLong("tailMs", incidents.tailMs).apply() })
+        Text("运动阈值 ${(incidents.motionThreshold * 100).toInt()}% 画幅", color = Color.White, style = MaterialTheme.typography.bodySmall)
+        Slider(incidents.motionThreshold, { incidents.motionThreshold = it; clockTick++ }, valueRange = .03f.. .12f,
+            onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putFloat("motionThreshold", incidents.motionThreshold).apply() })
+        Text("置信度阈值 ${(confidence * 100).toInt()}%", color = Color.White, style = MaterialTheme.typography.bodySmall)
+        Slider(confidence, { confidence = it; inferenceThreshold = it }, valueRange = .2f.. .8f, onValueChangeFinished = { getPreferences(MODE_PRIVATE).edit().putFloat("threshold", confidence).apply() })
+        Text(result?.let { "处理 ${it.elapsedMs} ms · ${if (live) "相机最多 8 次/秒" else "图片识别"}" } ?: "EfficientDet-Lite0", color = Color(0xFFA8C2C9), style = MaterialTheme.typography.bodySmall)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            OutlinedButton(enabled = !recording && !busy && detector != null, onClick = onCamera) { Text(if (live && running) "暂停" else "相机") }
+            OutlinedButton(enabled = !recording && !busy && detector != null, onClick = onPhoto) { Text("选图片") }
+            OutlinedButton(enabled = !recording && !busy && detector != null, onClick = onSample) { Text("测试图") }
+        }
     }
 
     private fun showPhoto(load: () -> Bitmap) {
@@ -452,6 +731,7 @@ class MainActivity : ComponentActivity() {
         }
     }
     override fun onDestroy() {
+        unregisterReceiver(shutterActions)
         destroyed.set(true);voice.close();feed?.release()
         worker.execute { workerDetector?.close() };worker.shutdown()
         super.onDestroy()

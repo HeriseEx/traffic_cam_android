@@ -22,6 +22,8 @@ import org.junit.Test
 import org.junit.rules.ExternalResource
 import org.junit.rules.RuleChain
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
+import android.view.MotionEvent
 import java.security.MessageDigest
 import java.io.File
 
@@ -202,11 +204,11 @@ class VehicleSmokeTest {
         val sync = TaskSync.get(context)
         val previous = sync.connection.load()
         val prefs = context.getSharedPreferences("MainActivity", android.content.Context.MODE_PRIVATE)
-        val auto = prefs.getBoolean("automatic", true)
+        val mode = prefs.getString("violationMode", "AUTO")
         var testEvent: String? = null
         try {
             sync.connection.save("http://127.0.0.1:1", "offline-test")
-            prefs.edit().putBoolean("automatic", false).apply()
+            prefs.edit().putString("violationMode", "CUT_IN").apply()
             ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(
                 "pm grant ${context.packageName} android.permission.CAMERA")).use { it.readBytes() }
             ui.activityRule.scenario.recreate()
@@ -214,17 +216,16 @@ class VehicleSmokeTest {
             val began = System.currentTimeMillis()
             ui.waitUntil(25_000) { ring.listFiles().orEmpty().any { it.lastModified() >= began && it.length() > 1000 } && System.currentTimeMillis() - began > 6500 }
             val prior = sync.state.value.records.map { it.optString("event_id") }.toSet()
-            ui.onNodeWithText("标记重点").performClick()
-            ui.onNodeWithText("结束片段").assertExists()
-            val marked = System.currentTimeMillis()
-            ui.waitUntil(5000) { System.currentTimeMillis() - marked > 2000 }
+            press("按住取证")
+            SystemClock.sleep(4500)
             ui.activityRule.scenario.recreate()
-            ui.waitUntil(25_000) { sync.state.value.records.any { it.optString("event_id") !in prior && it.optString("status") == "PENDING_UPLOAD" } }
+            releaseFinger()
+            ui.waitUntil(25_000) { sync.state.value.records.any { it.optString("event_id") !in prior && it.optString("status") in setOf("PENDING_UPLOAD", "NEED_NOTE") } }
             val task = sync.state.value.records.first { it.optString("event_id") !in prior }
             testEvent = task.getString("event_id")
             val file = File(sync.clips, task.getString("local_file"))
             val duration = Mp4Join.durationMs(file)
-            assertTrue("prebuffer and postbuffer duration=$duration", duration >= 6000)
+            assertTrue("held recording duration=$duration", duration >= 3000)
             assertNotNull(task.getJSONObject("metadata").optJSONObject("capture"))
             assertTrue(file.isFile)
             kotlinx.coroutines.runBlocking {
@@ -245,7 +246,7 @@ class VehicleSmokeTest {
             ui.onNodeWithText("返回监看").performScrollTo().performClick()
         } finally {
             testEvent?.let { kotlinx.coroutines.runBlocking { sync.discardLocal(it) } }
-            prefs.edit().putBoolean("automatic", auto).apply()
+            prefs.edit().putString("violationMode", mode).apply()
             if (previous.first.isBlank()) sync.connection.clear() else sync.connection.save(previous.first, previous.second)
         }
     }
@@ -263,7 +264,7 @@ class VehicleSmokeTest {
                 .put("duration_ms", 3000).put("recording_gaps_ms", 0).put("incidents", org.json.JSONArray().put(
                     JSONObject().put("track_id", 7).put("kind", "RED_LIGHT").put("start_ms", 500).put("end_ms", 1800)
                         .put("plate", "川A12345").put("plate_confirmed", true)))
-            val pending = kotlinx.coroutines.runBlocking { sync.enqueue(file, "automatic", "链路测试", "RED_LIGHT", capture) }
+            val pending = kotlinx.coroutines.runBlocking { sync.enqueue(file, "automatic", "链路测试", "RED_LIGHT", capture, note = "仪器测试") }
             val api = sync.client()
             val metadata = pending.getJSONObject("metadata")
             val uploaded = api.upload(file, metadata, pending.getString("sha256"))
@@ -320,9 +321,10 @@ class VehicleSmokeTest {
         ui.onNodeWithText("完成").performClick()
         val warmed = System.currentTimeMillis()
         ui.waitUntil(20_000) { System.currentTimeMillis() - warmed >= 12_000 }
-        ui.onNodeWithText("标记重点").performClick()
-        waitForText("正在录制重点片段")
-        ui.onNodeWithText("结束片段").assertExists()
+        press("按住取证")
+        waitForText("正在录音录像")
+        ui.onNodeWithText("松开提交").assertExists()
+        releaseFinger()
         ui.activityRule.scenario.recreate()
         menu(); settings(); waitForText("相机最多 8 次/秒")
         ui.onNodeWithText("完成").performClick()
@@ -376,6 +378,19 @@ class VehicleSmokeTest {
         ui.onNodeWithText("关闭语音").performClick()
     }
 
+    private var heldX = 0f
+    private var heldY = 0f
+    private fun press(label: String) {
+        val bounds = ui.onNodeWithText(label).fetchSemanticsNode().boundsInWindow
+        heldX = bounds.center.x; heldY = bounds.center.y
+        InstrumentationRegistry.getInstrumentation().uiAutomation.injectInputEvent(pointer(MotionEvent.ACTION_DOWN), true)
+    }
+    private fun releaseFinger() {
+        InstrumentationRegistry.getInstrumentation().uiAutomation.injectInputEvent(pointer(MotionEvent.ACTION_UP), true)
+    }
+    private fun pointer(action: Int) = MotionEvent.obtain(
+        SystemClock.uptimeMillis(), SystemClock.uptimeMillis(), action, heldX, heldY, 0
+    ).also { it.source = android.view.InputDevice.SOURCE_TOUCHSCREEN }
     private fun configureBackend(): TaskSync {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val token = File(context.filesDir, "backend-test-token").readText().trim()

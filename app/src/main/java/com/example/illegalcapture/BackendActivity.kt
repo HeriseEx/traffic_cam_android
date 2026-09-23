@@ -61,6 +61,8 @@ class BackendActivity : ComponentActivity() {
         var busy by remember { mutableStateOf(false) }
         var preview by remember { mutableStateOf<java.io.File?>(null) }
         var deleteTarget by remember { mutableStateOf<String?>(null) }
+        var noteTarget by remember { mutableStateOf<String?>(null) }
+        var noteText by remember { mutableStateOf("") }
         val state by sync.state.collectAsState()
         fun action(block: suspend () -> String) {
             lifecycleScope.launch {
@@ -110,9 +112,31 @@ class BackendActivity : ComponentActivity() {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(endpoint, { endpoint = it }, label = { Text("服务地址") }, singleLine = true,
                         enabled = !busy, modifier = Modifier.weight(1f))
+                    OutlinedButton(enabled = !busy, onClick = { endpoint = ServerConnection.LOCAL }) { Text("本机") }
                     OutlinedButton(enabled = !busy, onClick = { endpoint = ServerConnection.REMOTE }) { Text("重置") }
                 }
-                Text("打开即自动登录，记录本机型号和 IP。默认同 ${ServerConnection.REMOTE}，可多台同时在线。本机联调 ${ServerConnection.LOCAL}。", style = MaterialTheme.typography.bodySmall)
+                Text("先保存地址，再用取证账户登录。管理员账户不能上传。邀请链接里带有服务地址，30 分钟、只能用一次。", style = MaterialTheme.typography.bodySmall)
+                var accountName by remember { mutableStateOf("") }
+                var accountPassword by remember { mutableStateOf("") }
+                var inviteToken by remember { mutableStateOf("") }
+                OutlinedTextField(accountName, { accountName = it }, label = { Text("用户名") }, singleLine = true, enabled = !busy)
+                OutlinedTextField(accountPassword, { accountPassword = it }, label = { Text("密码") }, singleLine = true, enabled = !busy, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(enabled = !busy && accountName.isNotBlank() && accountPassword.length >= 8, onClick = { action {
+                        val name = withContext(Dispatchers.IO) { sync.loginAccount(accountName.trim(), accountPassword) }
+                        "已登录 $name"
+                    } }) { Text("登录") }
+                    OutlinedTextField(inviteToken, { inviteToken = it }, label = { Text("邀请链接") }, singleLine = true, enabled = !busy, modifier = Modifier.weight(1f))
+                    OutlinedButton(enabled = !busy && inviteToken.isNotBlank() && accountName.isNotBlank() && accountPassword.length >= 8, onClick = { action {
+                        val (origin, token) = splitInvite(inviteToken)
+                        if (origin.isNotEmpty()) endpoint = origin
+                        val name = withContext(Dispatchers.IO) {
+                            if (origin.isNotEmpty()) sync.connection.save(origin, "")
+                            sync.registerAccount(token, accountName.trim(), accountPassword)
+                        }
+                        "已注册 $name"
+                    } }) { Text("注册") }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(enabled = !busy, onClick = { action {
                         withContext(Dispatchers.IO) {
@@ -155,6 +179,11 @@ class BackendActivity : ComponentActivity() {
                         Text("车牌：${result?.optString("plate")?.takeUnless { it.isBlank() || it == "null" } ?: "未确认"}")
                         Text("信号灯：${signalName(task.optJSONObject("result")?.optJSONObject("signal_state"))}")
                         Text("违法行为：${violationName(result?.optString("violation_type").orEmpty())}")
+                        val spoken = task.optJSONObject("result")
+                        val transcript = spoken?.optString("transcript")?.takeUnless { it.isBlank() || it == "null" }
+                        if (transcript != null) Text("口述原文：$transcript")
+                        val matched = spoken?.optString("spoken_type")?.takeUnless { it.isBlank() || it == "null" }
+                        if (matched != null) Text("口述匹配：${violationName(matched)}")
                         val capture = task.optJSONObject("metadata")?.optJSONObject("capture") ?: task.optJSONObject("mobile_capture")
                         if (capture != null) {
                             Text("动态片段 ${"%.1f".format(capture.optLong("duration_ms") / 1000f)} 秒 · ${capture.optJSONArray("incidents")?.length() ?: 0} 个动作", style=MaterialTheme.typography.bodySmall)
@@ -179,7 +208,9 @@ class BackendActivity : ComponentActivity() {
                                 }
                                 preview=file; "已打开片段"
                             }}) { Text("查看片段") }
-                            if(task.optString("status") in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR"))
+                            if (task.optString("status") == "NEED_NOTE")
+                                TextButton(enabled=!busy, onClick={noteTarget=task.getString("event_id"); noteText=""}) { Text("填写备注") }
+                            if(task.optString("status") in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR", "NEED_NOTE"))
                                 TextButton(enabled=!busy, onClick={deleteTarget=task.getString("event_id")}) { Text("删除本地片段") }
                         }
                     } }
@@ -207,16 +238,36 @@ class BackendActivity : ComponentActivity() {
         deleteTarget?.let { id -> AlertDialog(onDismissRequest={deleteTarget=null}, title={Text("删除本地片段？")},
             text={Text("此片段尚未上传，删除后无法恢复。")}, dismissButton={TextButton(onClick={deleteTarget=null}){Text("保留")}},
             confirmButton={TextButton(onClick={deleteTarget=null;action {sync.discardLocal(id);"已删除"}}){Text("删除")}}) }
+        noteTarget?.let { id -> AlertDialog(onDismissRequest={noteTarget=null}, title={Text("没有定位，填写备注后才能上传")},
+            text={OutlinedTextField(noteText, {noteText=it}, label={Text("备注")})},
+            dismissButton={TextButton(onClick={noteTarget=null}){Text("取消")}},
+            confirmButton={TextButton(enabled=noteText.isNotBlank(), onClick={
+                val text=noteText; noteTarget=null; action { sync.attachNote(id, text); "已提交备注" }
+            }){Text("上传")}}) }
     }
+}
+
+private fun splitInvite(raw: String): Pair<String, String> {
+    val text = raw.trim()
+    if (!text.startsWith("http://") && !text.startsWith("https://")) return "" to text
+    val uri = android.net.Uri.parse(text)
+    val token = uri.getQueryParameter("token")?.trim().orEmpty()
+    require(token.length >= 16) { "邀请链接里没有有效邀请码" }
+    val origin = "${uri.scheme}://${uri.authority}".trimEnd('/')
+    require(origin.length > 8) { "邀请链接里没有服务地址" }
+    return origin to token
 }
 
 fun taskStatus(value: String) = when (value) {
     "PENDING_UPLOAD" -> "本地待上传"; "QUEUED" -> "服务器排队中"; "PROCESSING" -> "服务器分析中"
     "ANALYZED" -> "服务器分析完成"; "REJECTED" -> "未检出或视频无效"; "EXPIRED" -> "视频已过期"
-    "UPLOAD_ERROR" -> "上传受阻 · 原片已保留"; "ERROR", "LOCAL_ERROR" -> "处理失败"; else -> value
+    "UPLOAD_ERROR" -> "上传受阻 · 原片已保留"; "NEED_NOTE" -> "缺少定位，需填写备注"
+    "ERROR", "LOCAL_ERROR" -> "处理失败"; else -> value
 }
 fun violationName(value: String) = when (value) {
-    "LATERAL_MOVEMENT" -> "横向移动（待复核）"; "SOLID_LINE" -> "疑似压实线"; "WRONG_WAY" -> "疑似逆行"; "RED_LIGHT" -> "疑似闯红灯"
+    "LATERAL_MOVEMENT" -> "横向移动（待复核）"; "SOLID_LINE" -> "压实线"; "WRONG_WAY" -> "逆行"; "RED_LIGHT" -> "闯红灯"
+    "EMERGENCY_LANE" -> "侵走高速应急车道"; "NO_SIGNAL" -> "变道不打灯"; "OVERTAKE" -> "越线超车"
+    "DANGEROUS_CHANGE" -> "危险变道"; "CUT_IN" -> "加塞"; "ILLEGAL_PARKING" -> "主城区机动车乱停乱放"
     "RESTRICTED_LANE" -> "疑似占用专用车道"; "NONE" -> "未发现违法"; else -> "无法可靠判定"
 }
 fun signalName(state: JSONObject?): String = signalLabel(state?.optString("color").orEmpty(), state?.optBoolean("stable") == true)

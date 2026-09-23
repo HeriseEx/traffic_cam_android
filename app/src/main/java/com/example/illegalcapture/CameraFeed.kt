@@ -1,6 +1,8 @@
 package com.example.illegalcapture
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.RectF
@@ -8,10 +10,13 @@ import android.os.SystemClock
 import android.util.Rational
 import android.util.Size
 import android.view.Surface
+import android.view.TextureView
+import android.view.View
 import android.widget.FrameLayout
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraInfo
+import androidx.camera.core.DynamicRange
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
@@ -50,11 +55,14 @@ class CameraFeed(
     private val onResult: (DetectionResult, Long) -> DetectionResult,
     private val onError: (String) -> Unit,
     private val onJpeg: (ByteArray, Long) -> Unit = { _, _ -> },
+    tier: String = "1080",
+    private val onTier: (String) -> Unit = {},
 ) : FrameLayout(context) {
     private val preview = PreviewView(context).apply {
         scaleType = PreviewView.ScaleType.FIT_CENTER
         implementationMode = PreviewView.ImplementationMode.COMPATIBLE
     }
+    private val qhdView = TextureView(context).apply { visibility = View.GONE }
     private val overlay = DetectionOverlay(context)
     private var showBoxes = true
     private val active = AtomicBoolean(true)
@@ -71,20 +79,18 @@ class CameraFeed(
         .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
         .setResolutionSelector(sixteenNine)
         .build()
-    private val recorder = Recorder.Builder()
-        .setAspectRatio(AspectRatio.RATIO_16_9)
-        .setTargetVideoEncodingBitRate(4_000_000)
-        .setQualitySelector(
-            QualitySelector.fromOrderedList(
-                listOf(Quality.FHD, Quality.HD, Quality.SD),
-                FallbackStrategy.lowerQualityOrHigherThan(Quality.HD)
-            )
-        ).build()
-    private val video = VideoCapture.withOutput(recorder)
+    private var tierId = tier
+    private var tierChecked = false
+    private var recorder = buildRecorder()
+    private var video = VideoCapture.withOutput(recorder)
     private var recording: Recording? = null
+    private var qhd: QhdCamera? = null
+    private var qhdBusy = false
     private var ready = false
     private var lastFrame = 0L
     private var lastJpeg = 0L
+    private var wantStill = false
+    private var spoken = false
     private val ringDir = File(context.filesDir, "ring").apply { mkdirs() }
     private val ring = ArrayDeque<VideoSegment>()
     private val exporting = mutableSetOf<File>()
@@ -107,12 +113,62 @@ class CameraFeed(
 
     init {
         addView(preview, LayoutParams(-1, -1))
+        addView(qhdView, LayoutParams(-1, -1))
         addView(overlay, LayoutParams(-1, -1))
         post { start() }
     }
 
+    private fun buildRecorder(): Recorder {
+        val quality = when (RecordingTier.qualityName(tierId)) {
+            "HD" -> Quality.HD
+            "UHD" -> Quality.UHD
+            else -> Quality.FHD
+        }
+        return Recorder.Builder()
+            .setAspectRatio(AspectRatio.RATIO_16_9)
+            .setTargetVideoEncodingBitRate(RecordingTier.bitrate(RecordingTier.byId(tierId)).toInt())
+            .setQualitySelector(QualitySelector.from(quality, FallbackStrategy.lowerQualityOrHigherThan(Quality.HD)))
+            .build()
+    }
+
+    fun supportedTiers(): List<RecordingTier.Tier> {
+        val info = cameraInfo ?: return emptyList()
+        val names = Recorder.getVideoCapabilities(info).getSupportedQualities(DynamicRange.SDR).mapNotNull {
+            when (it) {
+                Quality.HD -> "HD"
+                Quality.FHD -> "FHD"
+                Quality.UHD -> "UHD"
+                else -> null
+            }
+        }.toSet()
+        val tiers = RecordingTier.offered(names).toMutableList()
+        if (QhdCamera.supported(context) && tiers.none { it.id == "1440" }) {
+            val at = tiers.indexOfFirst { it.height > 1440 }.let { if (it < 0) tiers.size else it }
+            tiers.add(at, RecordingTier.byId("1440"))
+        }
+        return tiers
+    }
+
+    fun setTier(id: String) {
+        val allowed = id == "1440" && QhdCamera.supported(context) || RecordingTier.qualityName(id) != null
+        if (capturing || !allowed || id == tierId) return
+        tierId = id
+        tierChecked = true
+        onTier(id)
+        if (ready) updateRotation()
+    }
+
     private fun start() {
         if (!active.get()) return
+        if (tierId == "1440" && QhdCamera.supported(context)) {
+            startQhd()
+            return
+        }
+        if (tierId == "1440") {
+            tierId = "1080"
+            onTier("1080")
+        }
+        closeQhd()
         session++
         val mine = session
         looping = false
@@ -141,8 +197,13 @@ class CameraFeed(
                         val frameHeight = bitmap.height
                         var jpeg: ByteArray? = null
                         val result = try {
-                            val detected = detector.detect(bitmap, threshold())
-                            if (now - lastJpeg >= 1500) {
+                            val detected = detector.detect(bitmap, threshold()).let { raw ->
+                                raw.copy(road = RoadScan.marks(bitmap), vehicles = raw.vehicles.map { vehicle ->
+                                    vehicle.copy(signalOff = RoadScan.lampOff(bitmap, vehicle.box))
+                                })
+                            }
+                            if (wantStill || now - lastJpeg >= 1500) {
+                                wantStill = false
                                 lastJpeg = now
                                 val bytes = ByteArrayOutputStream()
                                 bitmap.compress(Bitmap.CompressFormat.JPEG, 90, bytes)
@@ -197,13 +258,28 @@ class CameraFeed(
                     .build()
                 cameraPreview.targetRotation = rotation
                 analysis.targetRotation = rotation
-                video.targetRotation = rotation
                 cameraInfo?.cameraState?.removeObservers(owner)
-                cameraProvider.unbind(cameraPreview, analysis, video)
+                cameraProvider.unbindAll()
+                recorder = buildRecorder()
+                video = VideoCapture.withOutput(recorder)
+                video.targetRotation = rotation
                 val camera = cameraProvider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA,
                     UseCaseGroup.Builder().setViewPort(viewPort)
                         .addUseCase(cameraPreview).addUseCase(analysis).addUseCase(video).build())
                 cameraInfo = camera.cameraInfo
+                if (!tierChecked) {
+                    tierChecked = true
+                    val offered = supportedTiers()
+                    val chosen = RecordingTier.choose(offered, tierId)
+                    if (offered.isNotEmpty() && chosen.id != tierId) {
+                        tierId = chosen.id
+                        onTier(chosen.id)
+                        cameraProvider.unbindAll()
+                        post { start() }
+                        return@addListener
+                    }
+                    onTier(tierId)
+                }
                 ready = true
                 looping = true
                 if (recording == null) beginSegment()
@@ -227,30 +303,235 @@ class CameraFeed(
         recording?.stop() ?: post { start() }
     }
 
+    fun takeStill() { wantStill = true }
+
     fun record(file: File, seconds: Int, onSeconds: (Int) -> Unit, onComplete: (File?, String?) -> Unit,
-        startAtMs: Long = SystemClock.elapsedRealtime() - 10_000): Boolean {
+        startAtMs: Long = SystemClock.elapsedRealtime() - 10_000, spokenCapture: Boolean = false): Boolean {
         if (!ready || capturing || joining || !active.get()) return false
-        capturing = true; finishRequested = false
+        capturing = true; finishRequested = false; spoken = spokenCapture
         captureDest = file; captureOnSeconds = onSeconds; captureOnComplete = onComplete
         captureStartedAt = SystemClock.elapsedRealtime()
-        captureFrom = startAtMs.coerceAtLeast(captureStartedAt - 20_000)
+        captureFrom = if (spokenCapture) captureStartedAt else startAtMs.coerceAtLeast(captureStartedAt - 20_000)
         captureDeadline = minOf(captureStartedAt + seconds.coerceIn(3, 65) * 1000, captureFrom + 80_000)
         captureUntil = Long.MAX_VALUE
         lastClipTiming = null
-        if (recording == null) beginSegment()
+        if (spokenCapture) {
+            if (recording != null) recording?.stop()
+            else if (tierId == "1440" && qhdBusy) qhd?.stopSegment()
+            else startSpoken()
+        } else if (recording == null) beginSegment()
         return true
+    }
+
+    private fun closeQhd() {
+        qhd?.close()
+        qhd = null
+        qhdBusy = false
+        qhdView.visibility = View.GONE
+        preview.visibility = View.VISIBLE
+    }
+
+    private fun startQhd() {
+        if (qhd != null) return
+        provider?.unbindAll()
+        preview.visibility = View.GONE
+        qhdView.visibility = View.VISIBLE
+        val camera = QhdCamera(context, qhdView, { bitmap -> executor.execute { deliverQhd(bitmap) } }, onError)
+        qhd = camera
+        camera.open {
+            if (!active.get() || tierId != "1440") return@open
+            ready = true
+            tierChecked = true
+            looping = true
+            onTier("1440")
+            if (!qhdBusy) beginQhdSegment()
+        }
+    }
+
+    private fun deliverQhd(bitmap: Bitmap) {
+        val now = SystemClock.elapsedRealtime()
+        val detected = try {
+            detector.detect(bitmap, threshold()).let { raw ->
+                raw.copy(road = RoadScan.marks(bitmap), vehicles = raw.vehicles.map { vehicle ->
+                    vehicle.copy(signalOff = RoadScan.lampOff(bitmap, vehicle.box))
+                })
+            }
+        } catch (error: Exception) {
+            bitmap.recycle()
+            onError("识别失败：${error.message}")
+            return
+        }
+        var jpeg: ByteArray? = null
+        if (wantStill || now - lastJpeg >= 1500) {
+            wantStill = false
+            lastJpeg = now
+            val bytes = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, bytes)
+            jpeg = bytes.toByteArray().takeIf { it.size <= 2 * 1024 * 1024 }
+        }
+        bitmap.recycle()
+        post {
+            if (!active.get()) return@post
+            val labeled = onResult(detected, now)
+            jpeg?.let { onJpeg(it, now) }
+            val viewW = qhdView.width.coerceAtLeast(1)
+            val viewH = qhdView.height.coerceAtLeast(1)
+            val scale = minOf(viewW / detected.width.toFloat(), viewH / detected.height.toFloat())
+            val dx = (viewW - detected.width * scale) / 2
+            val dy = (viewH - detected.height * scale) / 2
+            fun map(box: RectF) = RectF(box.left * scale + dx, box.top * scale + dy, box.right * scale + dx, box.bottom * scale + dy)
+            overlay.vehicles = if (!showBoxes) emptyList() else labeled.vehicles.map { it.copy(box = map(it.box)) }
+            overlay.lamps = if (!showBoxes) emptyList() else labeled.lamps.map { it.copy(box = map(it.box)) }
+            overlay.plates = emptyList()
+        }
+    }
+
+    private fun beginQhdSegment() {
+        val camera = qhd ?: return
+        if (!ready || qhdBusy || !active.get()) return
+        if (ringDir.usableSpace < 150L * 1024 * 1024) {
+            looping = false
+            onError("空间不足，已停止缓存，请处理本地片段")
+            return
+        }
+        val file = File(ringDir, "seg-${System.nanoTime()}.mp4")
+        qhdBusy = true
+        val started = camera.startSegment(file, false) { ok, duration ->
+            qhdBusy = false
+            val start = SystemClock.elapsedRealtime() - duration
+            onSegmentFinal(file, start, duration, ok && file.length() > 0)
+        }
+        if (!started) {
+            qhdBusy = false
+            file.delete()
+        }
+    }
+
+    private fun startQhdSpoken() {
+        val dest = captureDest ?: return
+        val camera = qhd ?: return
+        val audio = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        qhdBusy = true
+        captureStartedAt = SystemClock.elapsedRealtime()
+        tickSpoken()
+        val started = camera.startSegment(dest, audio) { ok, duration ->
+            qhdBusy = false
+            spoken = false
+            capturing = false
+            finishRequested = false
+            lastClipTiming = ClipTiming(captureStartedAt, captureStartedAt + duration, 0)
+            val kept = ok && duration >= 3_000 && dest.length() > 0
+            if (!kept) dest.delete()
+            val done = captureOnComplete
+            captureOnComplete = { _, _ -> }
+            captureDest = null
+            done(if (kept) dest else null, if (kept) null else if (duration < 3_000) "不足 3 秒，已丢弃" else "录音录像失败")
+            if (looping && active.get() && !qhdBusy) beginQhdSegment()
+        }
+        if (!started) {
+            qhdBusy = false
+            spoken = false
+            capturing = false
+            val done = captureOnComplete
+            captureOnComplete = { _, _ -> }
+            captureDest = null
+            done(null, "无法开始录音录像")
+        }
+    }
+
+    private fun onSegmentFinal(file: File, segmentStart: Long, duration: Long, usable: Boolean) {
+        if (spoken && capturing) {
+            if (usable) ring.addLast(VideoSegment(file, segmentStart, segmentStart + duration)) else file.delete()
+            if (finishRequested || !active.get()) {
+                spoken = false; capturing = false; finishRequested = false
+                captureDest?.delete(); captureDest = null
+                val done = captureOnComplete
+                captureOnComplete = { _, _ -> }
+                done(null, "不足 3 秒，已丢弃")
+                if (looping && active.get()) beginSegment()
+            } else startSpoken()
+        } else {
+            if (usable) ring.addLast(VideoSegment(file, segmentStart, segmentStart + duration)) else file.delete()
+            if (capturing && !joining && (finishRequested || !active.get() || !usable)) {
+                captureUntil = minOf(captureUntil, SystemClock.elapsedRealtime())
+                finishJoin()
+            }
+            if (rebind && !capturing && active.get()) {
+                clearRing(); rebind = false; start()
+            } else if (looping && active.get()) beginSegment()
+            evict()
+        }
+    }
+
+    private fun tickSpoken() {
+        if (!spoken || !capturing) return
+        captureOnSeconds(((SystemClock.elapsedRealtime() - captureStartedAt) / 1000).toInt())
+        postDelayed({ tickSpoken() }, 500)
+    }
+
+    private fun startSpoken() {
+        if (tierId == "1440") { startQhdSpoken(); return }
+        val dest = captureDest ?: return
+        try {
+            val options = FileOutputOptions.Builder(dest).build()
+            var pending = recorder.prepareRecording(context, options)
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+                pending = pending.withAudioEnabled()
+            captureStartedAt = SystemClock.elapsedRealtime()
+            captureFrom = captureStartedAt
+            recording = pending.start(ContextCompat.getMainExecutor(context)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        captureStartedAt = SystemClock.elapsedRealtime()
+                        captureFrom = captureStartedAt
+                    }
+                    is VideoRecordEvent.Status -> {
+                        val now = SystemClock.elapsedRealtime()
+                        captureOnSeconds(((now - captureStartedAt) / 1000).toInt())
+                        if (now - captureStartedAt >= 65_000 || event.recordingStats.numBytesRecorded > 42L * 1024 * 1024) stopRecording()
+                    }
+                    is VideoRecordEvent.Finalize -> {
+                        recording = null
+                        val duration = event.recordingStats.recordedDurationNanos / 1_000_000
+                        val ok = event.error in setOf(
+                            VideoRecordEvent.Finalize.ERROR_NONE,
+                            VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE,
+                        ) && dest.length() > 0 && duration > 0
+                        spoken = false
+                        capturing = false
+                        finishRequested = false
+                        lastClipTiming = ClipTiming(captureStartedAt, captureStartedAt + duration, 0)
+                        val done = captureOnComplete
+                        captureOnComplete = { _, _ -> }
+                        captureDest = null
+                        done(if (ok) dest else null, if (ok) null else "录音录像失败")
+                        if (looping && active.get() && recording == null) beginSegment()
+                    }
+                    else -> Unit
+                }
+            }
+        } catch (error: Exception) {
+            spoken = false
+            capturing = false
+            recording = null
+            val done = captureOnComplete
+            captureOnComplete = { _, _ -> }
+            captureDest = null
+            done(null, "无法开始录音录像：${error.message}")
+            if (looping && active.get()) beginSegment()
+        }
     }
 
     fun stopRecording() {
         if (!capturing || joining || finishRequested) return
         finishRequested = true
         captureUntil = SystemClock.elapsedRealtime()
-        recording?.stop() ?: finishJoin()
+        if (tierId == "1440") qhd?.stopSegment() else recording?.stop() ?: finishJoin()
     }
 
     fun pauseLoop() {
         looping = false
-        if (capturing) stopRecording() else recording?.stop()
+        if (capturing) stopRecording() else if (tierId == "1440") qhd?.stopSegment() else recording?.stop()
     }
 
     fun resumeLoop() {
@@ -260,6 +541,7 @@ class CameraFeed(
     }
 
     private fun beginSegment() {
+        if (tierId == "1440") { beginQhdSegment(); return }
         if (!ready || recording != null || !active.get()) return
         if (ringDir.usableSpace < 150L * 1024 * 1024) {
             looping = false
@@ -290,15 +572,7 @@ class CameraFeed(
                             VideoRecordEvent.Finalize.ERROR_DURATION_LIMIT_REACHED,
                             VideoRecordEvent.Finalize.ERROR_FILE_SIZE_LIMIT_REACHED,
                             VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE) && file.length() > 0 && duration > 0
-                        if (usable) ring.addLast(VideoSegment(file, segmentStart, segmentStart + duration)) else file.delete()
-                        if (capturing && !joining && (finishRequested || !active.get() || !usable)) {
-                            captureUntil = minOf(captureUntil, SystemClock.elapsedRealtime())
-                            finishJoin()
-                        }
-                        if (rebind && !capturing && active.get()) {
-                            clearRing(); rebind = false; start()
-                        } else if (looping && active.get()) beginSegment()
-                        evict()
+                        onSegmentFinal(file, segmentStart, duration, usable)
                     }
                 }
             }
@@ -343,7 +617,8 @@ class CameraFeed(
     fun release() {
         if (!active.getAndSet(false)) return
         looping = false; ready = false
-        if (capturing) stopRecording() else recording?.stop()
+        if (capturing) stopRecording() else if (tierId == "1440") qhd?.stopSegment() else recording?.stop()
+        closeQhd()
         analysis.clearAnalyzer()
         cameraInfo?.cameraState?.removeObservers(owner)
         provider?.unbind(cameraPreview, analysis, video)

@@ -15,7 +15,8 @@ import java.nio.ByteOrder
 
 data class Vehicle(val label: String, val score: Float, val box: RectF, val plate: String? = null,
     val trackId: Long = 0, val predicted: Boolean = false, val plateConfirmed: Boolean = false,
-    val path: List<TrackPoint> = emptyList(), val appearance: List<Float> = emptyList())
+    val path: List<TrackPoint> = emptyList(), val appearance: List<Float> = emptyList(),
+    val signalOff: Boolean? = null)
 data class Lamp(val color: String, val score: Float, val box: RectF)
 data class DetectionResult(
     val vehicles: List<Vehicle>,
@@ -23,10 +24,11 @@ data class DetectionResult(
     val lamps: List<Lamp> = emptyList(),
     val width: Int = 0,
     val height: Int = 0,
+    val road: RoadFrame = RoadFrame(),
 )
 
 fun DetectionResult.observations() = vehicles.map { v -> TrackObservation(v.label, v.score,
-    TrackBox(v.box.left / width, v.box.top / height, v.box.right / width, v.box.bottom / height), v.appearance) }
+    TrackBox(v.box.left / width, v.box.top / height, v.box.right / width, v.box.bottom / height), v.appearance, v.signalOff) }
 
 fun DetectionResult.withTracks(tracks: List<TrackedVehicle>) = copy(vehicles = tracks.map { t ->
     val b = t.observation.box

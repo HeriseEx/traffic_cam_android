@@ -71,13 +71,31 @@ class TaskSync private constructor(private val context: Context) {
         require(session.isNotBlank()) { "握手未返回会话" }
         connection.save(endpoint, session)
     }
+    fun loginAccount(username: String, password: String): String {
+        val endpoint = connection.load().first.trimEnd('/')
+        require(endpoint.isNotBlank()) { "请先保存服务地址" }
+        val out = BackendClient(endpoint, "").request("POST", "/v1/login", JSONObject()
+            .put("username", username).put("password", password))
+        connection.save(endpoint, out.getString("session"))
+        return out.getString("username")
+    }
+
+    fun registerAccount(token: String, username: String, password: String): String {
+        val endpoint = connection.load().first.trimEnd('/')
+        require(endpoint.isNotBlank()) { "请先保存服务地址" }
+        val out = BackendClient(endpoint, "").request("POST", "/v1/register", JSONObject()
+            .put("token", token).put("username", username).put("password", password))
+        connection.save(endpoint, out.getString("session"))
+        return out.getString("username")
+    }
+
     fun client(): BackendClient {
         handshake()
         val (endpoint, token) = connection.load()
         return BackendClient(endpoint, token)
     }
 
-    private val maxUploadBytes = 50L * 1024 * 1024
+    private val maxUploadBytes = 200L * 1024 * 1024
 
     private fun copyLimited(open: () -> InputStream, target: File) {
         require(clips.usableSpace > 150L * 1024 * 1024) { "可用空间不足，请先处理待上传片段" }
@@ -89,7 +107,7 @@ class TaskSync private constructor(private val context: Context) {
                     val n = input.read(buffer)
                     if (n < 0) break
                     total += n
-                    require(total <= maxUploadBytes) { "视频超过 50 MiB" }
+                    require(total <= maxUploadBytes) { "视频超过 200 MiB" }
                     output.write(buffer, 0, n)
                 }
                 output.fd.sync()
@@ -119,7 +137,7 @@ class TaskSync private constructor(private val context: Context) {
             val target = File(clips, "${UUID.randomUUID()}.mp4")
             try {
                 val timing = Mp4Join.window(listOf(VideoSegment(file, 0, Mp4Join.durationMs(file))), target, window.startMs, window.endMs)
-                require(target.length() in 1..maxUploadBytes) { "裁剪片段超过 50 MiB" }
+                require(target.length() in 1..maxUploadBytes) { "片段超过 200 MiB" }
                 val event = window.event
                 val capture = JSONObject().put("camera_mode", "moving").put("captured_at", file.lastModified() / 1000.0)
                     .put("duration_ms", timing.endMs - timing.startMs).put("recording_gaps_ms", 0)
@@ -134,9 +152,9 @@ class TaskSync private constructor(private val context: Context) {
         count
     }
 
-    suspend fun enqueue(file: File, trigger: String, text: String = "", candidateType: String = "UNKNOWN", capture: JSONObject? = null): JSONObject = withContext(Dispatchers.IO) {
+    suspend fun enqueue(file: File, trigger: String, text: String = "", candidateType: String = "UNKNOWN", capture: JSONObject? = null, place: JSONObject? = null, note: String = ""): JSONObject = withContext(Dispatchers.IO) {
         mutex.withLock {
-            require(file.length() in 1..maxUploadBytes) { "视频为空或超过 50 MiB" }
+            require(file.length() in 1..maxUploadBytes) { "视频为空或超过 200 MiB" }
             val existing = records().firstOrNull { it.optString("local_file") == file.name }
             if (existing != null) return@withLock existing
             val id = try { UUID.fromString(file.nameWithoutExtension).toString() } catch (_: Exception) { UUID.randomUUID().toString() }
@@ -149,6 +167,10 @@ class TaskSync private constructor(private val context: Context) {
                 .put("manual_review", false)
                 .put("trigger", trigger).put("trigger_text", text.take(160)).put("app_version", "2.0").put("model_version", "efficientdet-lite0")
             if (capture != null) metadata.put("capture", capture)
+            if (place != null) metadata.put("location", place)
+            if (note.isNotBlank()) metadata.put("location_note", note.trim())
+            val needsPlace = trigger in setOf("automatic", "manual", "voice") || candidateType == "ILLEGAL_PARKING"
+            val queued = if (needsPlace && place == null && note.isBlank()) "NEED_NOTE" else "PENDING_UPLOAD"
             val journal = AtomicFile(File(clips, file.name + ".event.json"))
             var savedEndpoint = endpoint
             if (journal.baseFile.isFile) {
@@ -159,13 +181,27 @@ class TaskSync private constructor(private val context: Context) {
                 try { stream.write(JSONObject().put("metadata", metadata).put("endpoint", endpoint).toString().toByteArray()); journal.finishWrite(stream) }
                 catch (error: Exception) { journal.failWrite(stream); throw error }
             }
-            val pending = JSONObject().put("event_id", metadata.getString("event_id")).put("status", "PENDING_UPLOAD").put("metadata", metadata)
+            val pending = JSONObject().put("event_id", metadata.getString("event_id")).put("status", queued).put("metadata", metadata)
                 .put("local_file", file.name).put("endpoint", savedEndpoint).put("created_at", System.currentTimeMillis() / 1000.0)
                 .put("sha256", digest.digest().joinToString("") { "%02x".format(it) })
             database.getJSONObject("records").put(pending.getString("event_id"), pending); persist(); publish(message = "片段已保存，等待自动上传")
             UploadJobService.schedule(context)
             pending
         }
+    }
+
+    suspend fun attachNote(eventId: String, note: String) = withContext(Dispatchers.IO) {
+        val text = note.trim()
+        require(text.isNotEmpty()) { "请填写备注" }
+        mutex.withLock {
+            val row = database.getJSONObject("records").optJSONObject(eventId) ?: error("记录不存在")
+            require(row.optString("status") == "NEED_NOTE") { "这条记录不需要备注" }
+            row.getJSONObject("metadata").put("location_note", text)
+            row.put("status", "PENDING_UPLOAD").remove("wire_metadata")
+            persist()
+            publish(message = "已补备注，等待上传")
+        }
+        tick()
     }
 
     suspend fun retryPending() = withContext(Dispatchers.IO) {
@@ -181,7 +217,7 @@ class TaskSync private constructor(private val context: Context) {
     suspend fun discardLocal(eventId: String) = withContext(Dispatchers.IO) {
         mutex.withLock {
             val row = database.getJSONObject("records").optJSONObject(eventId) ?: return@withLock
-            require(row.optString("status") in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR")) { "仅可删除未上传的本地片段" }
+            require(row.optString("status") in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR", "NEED_NOTE")) { "仅可删除未上传的本地片段" }
             val name = File(row.getString("local_file")).name
             val video = File(clips, name)
             require(!video.exists() || video.delete()) { "无法删除本地文件" }
@@ -252,7 +288,7 @@ class TaskSync private constructor(private val context: Context) {
                 rememberRemote(task)
             }
             persist()
-            records().filter { it.optString("status") !in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR") }.forEach { row ->
+            records().filter { it.optString("status") !in setOf("PENDING_UPLOAD", "UPLOAD_ERROR", "LOCAL_ERROR", "NEED_NOTE") }.forEach { row ->
                 row.optString("local_file").takeIf { it.isNotBlank() }?.let { name ->
                     File(clips, File(name).name).delete(); File(clips, File(name).name + ".event.json").delete()
                 }
